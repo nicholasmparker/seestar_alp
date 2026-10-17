@@ -173,6 +173,18 @@ class action:
             result = ""
 
             params = json.loads(parameters)
+            if action_name == "survey_snapshot":
+                from device.survey_snapshot import local_snapshot
+
+                result = local_snapshot(
+                    req.remote_addr, cur_dev, seestar_imager.get(devnum), params
+                )
+                # MethodResponse logs any supplied value. Attach image data
+                # only after construction, and bypass generic action logging.
+                response = MethodResponse(req)
+                response.Value = result
+                resp.text = response.json
+                return
             log_debug = False
             if action_name == "method_sync" and params["method"] in [
                 "scope_get_equ_coord",
