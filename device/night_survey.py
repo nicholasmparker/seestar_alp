@@ -206,7 +206,34 @@ class SurveyClient:
         request = {"method": method}
         if params is not None:
             request["params"] = params
-        return native_result(self.action("method_sync", request), method)
+        envelope = self.action("survey_native", request)
+        if (
+            not isinstance(envelope, dict)
+            or not isinstance(envelope.get("generation"), str)
+            or type(envelope.get("after_sequence")) is not int
+        ):
+            raise SurveyError("invalid_command_receipt")
+        reply = envelope.get("reply")
+        result = native_result(reply, method)
+        try:
+            stamp = reply["Timestamp"]
+            timestamp = float(stamp)
+            if type(stamp) is bool or not math.isfinite(timestamp) or timestamp < 0:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise SurveyError("invalid_command_timestamp") from None
+        previous = getattr(self, "last_receipt", None)
+        if previous is not None:
+            if envelope["generation"] != previous["generation"]:
+                raise SurveyError("connection_changed")
+            if timestamp < previous["device_timestamp"]:
+                raise SurveyError("device_time_regressed")
+        self.last_receipt = {
+            "generation": envelope["generation"],
+            "after_sequence": envelope["after_sequence"],
+            "device_timestamp": timestamp,
+        }
+        return result
 
 
 def private_directory(path):
@@ -299,16 +326,27 @@ class SurveyRunner:
             json.dumps(self.manifest, indent=2, allow_nan=False).encode(),
         )
 
-    def event(self, name):
-        response = self.client.action("get_event_state", {"event_name": name})
+    def events(self, name, receipt):
+        response = self.client.action(
+            "survey_events",
+            {
+                "event_name": name,
+                "generation": receipt["generation"],
+                "after_sequence": receipt["after_sequence"],
+            },
+        )
         if (
             not isinstance(response, dict)
-            or type(response.get("code")) is not int
-            or response.get("code") != 0
-            or not isinstance(response.get("result"), dict)
+            or response.get("generation") != receipt["generation"]
+            or not isinstance(response.get("events"), list)
         ):
-            raise SurveyError("invalid_event_state")
-        return response["result"]
+            raise SurveyError("invalid_event_receipt")
+        return [
+            item["event"]
+            for item in response["events"]
+            if type(item.get("sequence")) is int
+            and item["sequence"] > receipt["after_sequence"]
+        ]
 
     def operating_state(self):
         self.checkpoint()
@@ -406,19 +444,21 @@ class SurveyRunner:
         state, _ = self.operating_state()
         if not state["mount"]["close"]:
             return
-        previous = self.event("ScopeMoveToHorizon")
         self.client.native("scope_move_to_horizon")
+        receipt = dict(self.client.last_receipt)
         deadline = self.clock.monotonic() + 60
         while self.clock.monotonic() < deadline:
             self.sleep(1)
             state = self.client.native("get_device_state", {"keys": ["mount"]})
             mount = state.get("mount", {})
-            event = self.event("ScopeMoveToHorizon")
-            outcome = fresh_terminal(event, previous)
-            if outcome in ("fail", "cancel"):
+            outcomes = [
+                fresh_terminal(event, receipt["device_timestamp"])
+                for event in self.events("ScopeMoveToHorizon", receipt)
+            ]
+            if any(outcome in ("fail", "cancel") for outcome in outcomes):
                 raise SurveyError("arm_open_failed")
             if (
-                outcome == "complete"
+                "complete" in outcomes
                 and mount.get("close") is False
                 and mount.get("move_type") == "none"
             ):
@@ -490,27 +530,36 @@ class SurveyRunner:
         raise SurveyError("movement_budget_exhausted")
 
     def solve(self):
-        previous = self.event("PlateSolve")
         self.client.native("start_solve")
+        receipt = dict(self.client.last_receipt)
         deadline = self.clock.monotonic() + 25
+        started = False
         while self.clock.monotonic() < deadline:
             self.sleep(1)
-            event = self.event("PlateSolve")
-            outcome = fresh_terminal(event, previous)
-            if outcome in ("fail", "cancel"):
-                return None
-            result = event.get("result", {})
-            if (
-                outcome == "complete"
-                and isinstance(result, dict)
-                and result.get("ra_dec") is not None
-            ):
-                position = to_horizontal(result["ra_dec"], self.site, self.clock.now())
-                return {
-                    "position": position,
-                    "stars": result.get("star_number"),
-                    "timestamp": event["Timestamp"],
-                }
+            for event in self.events("PlateSolve", receipt):
+                if event.get("state") in ("working", "start") and fresh_terminal(
+                    {**event, "state": "complete"}, receipt["device_timestamp"]
+                ):
+                    started = True
+                outcome = fresh_terminal(event, receipt["device_timestamp"])
+                if not started:
+                    continue
+                if outcome in ("fail", "cancel"):
+                    return None
+                result = event.get("result", {})
+                if (
+                    outcome == "complete"
+                    and isinstance(result, dict)
+                    and result.get("ra_dec") is not None
+                ):
+                    position = to_horizontal(
+                        result["ra_dec"], self.site, self.clock.now()
+                    )
+                    return {
+                        "position": position,
+                        "stars": result.get("star_number"),
+                        "timestamp": event["Timestamp"],
+                    }
         return None
 
     def calibrate_pointing(self):
@@ -595,6 +644,8 @@ class SurveyRunner:
             "image_sha256": hashlib.sha256(data).hexdigest(),
             "frame_instance": image["instance"],
             "frame_sequence": image["sequence"],
+            "image_freshness": "newly_received; exposure_timestamp_unavailable",
+            "image_pointing_correlation": "unverified; use stellar solve for direction evidence",
             "classification": "stars_detected_not_all_clear" if solved else "unknown",
             "captured_at": self.clock.now().isoformat(),
         }
@@ -662,30 +713,29 @@ class SurveyRunner:
                 self.save(
                     status="complete",
                     phase="stationary",
+                    stationary_verified=True,
                     finished_at=self.clock.now().isoformat(),
                 )
             except SurveyError as error:
                 self.save(
                     status="cancelled" if str(error) == "cancelled" else "failed",
                     reason=str(error),
+                    stationary_verified=False,
                 )
                 raise
             except Exception:
-                self.save(status="failed", reason="unexpected_runner_error")
+                self.save(
+                    status="failed",
+                    reason="unexpected_runner_error",
+                    stationary_verified=False,
+                )
                 raise SurveyError("unexpected_runner_error") from None
             finally:
-                # No park or blind stop-slew. Every speed command expires in
-                # hardware. Do not stop a preview this run did not start.
+                # The firmware exposes no preview ownership token. Even a
+                # preview we started may have been replaced by a controller.
+                # Never issue a cleanup mutation under uncertain ownership.
                 if self.preview_started:
-                    try:
-                        view = self.client.native("get_view_state").get("View", {})
-                        if (
-                            view.get("stage") == "ContinuousExposure"
-                            and view.get("mode") == "star"
-                        ):
-                            self.client.native("iscope_stop_view")
-                    except Exception:
-                        self.save(cleanup="preview_stop_unconfirmed")
+                    self.save(cleanup="preview_left_running_ownership_unconfirmed")
             return summary(self.manifest)
 
 
@@ -702,6 +752,7 @@ def summary(manifest):
             "updated_at",
             "finished_at",
             "cleanup",
+            "stationary_verified",
         )
         if key in manifest
     }

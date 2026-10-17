@@ -173,6 +173,14 @@ class action:
             result = ""
 
             params = json.loads(parameters)
+            if action_name in ("survey_native", "survey_events"):
+                from device.survey_transport import local_action
+
+                result = local_action(req.remote_addr, cur_dev, action_name, params)
+                response = MethodResponse(req)
+                response.Value = result
+                resp.text = response.json
+                return
             if action_name == "survey_snapshot":
                 from device.survey_snapshot import local_snapshot
 

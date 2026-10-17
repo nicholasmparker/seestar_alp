@@ -31,7 +31,17 @@ def test_native_contract_over_real_http():
             reply = {
                 "ErrorNumber": 0,
                 "Value": json.dumps(
-                    {"id": 7, "code": 0, "method": method, "result": [20, 180]}
+                    {
+                        "generation": "http-fixture",
+                        "after_sequence": 0,
+                        "reply": {
+                            "id": 7,
+                            "code": 0,
+                            "method": method,
+                            "Timestamp": "1",
+                            "result": [20, 180],
+                        },
+                    }
                 ),
             }
             if method == "reject":
@@ -50,7 +60,7 @@ def test_native_contract_over_real_http():
             assert client.native("scope_get_horiz_coord") == [20, 180]
             with pytest.raises(SurveyError, match="alp_action_rejected"):
                 client.native("reject")
-            assert seen[0]["Action"] == ["method_sync"]
+            assert seen[0]["Action"] == ["survey_native"]
             assert seen[0]["ClientTransactionID"] == ["1"]
         finally:
             server.shutdown()

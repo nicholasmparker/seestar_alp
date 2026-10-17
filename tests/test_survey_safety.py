@@ -167,10 +167,17 @@ def test_displacement_rejects_runaway_and_wrong_axis():
 
 def test_fresh_event_requires_new_timestamp_and_success():
     old = {"Timestamp": "42", "state": "complete", "ra_dec": [12, 30]}
-    assert safety.fresh_terminal(old, old) is None
-    assert safety.fresh_terminal({**old, "Timestamp": "43"}, old) == "complete"
+    assert safety.fresh_terminal(old, 42.0) is None
+    assert safety.fresh_terminal({**old, "Timestamp": "43"}, 42.0) == "complete"
     assert (
-        safety.fresh_terminal({**old, "Timestamp": "44", "state": "fail"}, old)
+        safety.fresh_terminal({**old, "Timestamp": "44", "state": "fail"}, 42.0)
         == "fail"
     )
-    assert safety.fresh_terminal({**old, "Timestamp": None}, old) is None
+    assert safety.fresh_terminal({**old, "Timestamp": None}, 42.0) is None
+
+
+@pytest.mark.parametrize("baseline", [None, {}, "nan", float("nan"), True, -1])
+def test_missing_or_malformed_command_anchor_never_accepts_a_late_event(baseline):
+    assert (
+        safety.fresh_terminal({"Timestamp": "1", "state": "complete"}, baseline) is None
+    )

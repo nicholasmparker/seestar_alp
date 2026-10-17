@@ -134,20 +134,23 @@ def validate_step(before, after, axis, direction):
         raise SurveyError("unexpected_pulse_motion")
 
 
-def fresh_terminal(event, previous):
-    if not isinstance(event, dict):
+def fresh_terminal(event, command_timestamp):
+    if (
+        not isinstance(event, dict)
+        or not number(command_timestamp)
+        or command_timestamp < 0
+    ):
         return None
     stamp = event.get("Timestamp")
     try:
         stamp_value = float(stamp)
-        old = (
-            float(previous.get("Timestamp", "-inf"))
-            if isinstance(previous, dict)
-            else -math.inf
-        )
     except (TypeError, ValueError):
         return None
-    if not math.isfinite(stamp_value) or stamp_value <= old:
+    if (
+        type(stamp) is bool
+        or not math.isfinite(stamp_value)
+        or stamp_value <= command_timestamp
+    ):
         return None
     state = event.get("state")
     return state if state in ("complete", "fail", "cancel") else None

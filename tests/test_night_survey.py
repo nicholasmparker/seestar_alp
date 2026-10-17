@@ -65,6 +65,11 @@ class Scope:
 
     def native(self, method, params=None):
         self.clock.sleep(0.05)
+        self.last_receipt = {
+            "generation": "fixture",
+            "after_sequence": 0,
+            "device_timestamp": self.clock.elapsed,
+        }
         if method == "get_device_state":
             return copy.deepcopy(self.state)
         if method == "pi_is_verified":
@@ -88,7 +93,7 @@ class Scope:
         if method == "scope_move_to_horizon":
             self.state["mount"]["close"] = False
             self.events["ScopeMoveToHorizon"] = {
-                "Timestamp": str(self.clock.elapsed),
+                "Timestamp": str(self.clock.elapsed + 0.01),
                 "state": "complete",
             }
         elif method == "scope_speed_move":
@@ -108,7 +113,7 @@ class Scope:
                 tuple(self.position), (-105, 35), self.clock.now()
             )
             self.events["PlateSolve"] = {
-                "Timestamp": str(self.clock.elapsed),
+                "Timestamp": str(self.clock.elapsed + 0.01),
                 "state": "complete" if self.solve_success else "fail",
                 "result": {"ra_dec": [ra, dec], "star_number": 40, "fov": [4.0, 2.25]},
             }
@@ -129,6 +134,27 @@ class Scope:
             return {
                 "code": 0,
                 "result": copy.deepcopy(self.events.get(params["event_name"], {})),
+            }
+        if name == "survey_events":
+            event = self.events.get(params["event_name"])
+            start = (
+                [
+                    {
+                        "sequence": 1,
+                        "event": {
+                            "state": "working",
+                            "Timestamp": str(float(event["Timestamp"]) - 0.001),
+                        },
+                    }
+                ]
+                if event and params["event_name"] == "PlateSolve"
+                else []
+            )
+            return {
+                "generation": "fixture",
+                "events": start + [{"sequence": 2, "event": copy.deepcopy(event)}]
+                if event
+                else [],
             }
         if name == "survey_snapshot":
             data = cv2.imencode(".png", np.full((16, 16, 3), 100, np.uint16))[
@@ -232,12 +258,17 @@ def test_arm_timeout_is_not_retried(tmp_path):
 def test_stale_plate_solve_cannot_calibrate(tmp_path):
     run, scope, _ = runner(tmp_path)
     scope.events["PlateSolve"] = {
-        "Timestamp": "1",
+        "Timestamp": "0",
         "state": "complete",
         "result": {"ra_dec": [12, 30]},
     }
     original = scope.native
     scope.native = lambda m, p=None: 0 if m == "start_solve" else original(m, p)
+    scope.last_receipt = {
+        "generation": "fixture",
+        "after_sequence": 0,
+        "device_timestamp": 0.1,
+    }
     assert run.solve() is None
 
 
@@ -353,3 +384,85 @@ def test_capture_rejects_motion_during_failed_solve(tmp_path):
     with pytest.raises(SurveyError, match="position_changed_during_solve"):
         run.capture(0, (40, 180))
     assert run.manifest["samples"] == []
+
+
+def test_external_takeover_never_triggers_preview_cleanup(tmp_path):
+    run, scope, _ = runner(tmp_path)
+    run.preview_started = True
+    original = scope.action
+    scope.action = (
+        lambda name, params=None: {"state": "working"}
+        if name == "get_schedule"
+        else original(name, params)
+    )
+    with pytest.raises(SurveyError, match="scheduler_not_idle"):
+        run.run(clearance_confirmed=True, max_cells=1)
+    assert scope.writes == []
+
+
+def test_late_completion_without_new_solve_start_cannot_be_used(tmp_path):
+    run, scope, _ = runner(tmp_path)
+    run.preflight()
+    scope.position = [60, 180]
+    original = scope.action
+
+    def action(name, params=None):
+        result = original(name, params)
+        if name == "survey_events":
+            result["events"] = [
+                item
+                for item in result["events"]
+                if item["event"].get("state") == "complete"
+            ]
+        return result
+
+    scope.action = action
+    assert run.solve() is None
+
+
+@pytest.mark.parametrize("stamp", [None, "nan", True, "bad", -1])
+def test_native_command_requires_valid_device_timestamp(stamp):
+    client = survey.SurveyClient()
+    client.action = lambda *args: {
+        "generation": "test",
+        "after_sequence": 0,
+        "reply": {
+            "id": 1,
+            "code": 0,
+            "method": "get_device_state",
+            "result": {},
+            "Timestamp": stamp,
+        },
+    }
+    with pytest.raises(SurveyError, match="invalid_command_timestamp"):
+        client.native("get_device_state")
+
+
+@pytest.mark.parametrize(
+    "generation,stamp,reason",
+    [("new", "11", "connection_changed"), ("old", "1", "device_time_regressed")],
+)
+def test_reconnection_or_device_clock_regression_invalidates_whole_client(
+    generation, stamp, reason
+):
+    client = survey.SurveyClient()
+    replies = iter([("old", "10"), (generation, stamp)])
+
+    def action(*args):
+        gen, timestamp = next(replies)
+        return {
+            "generation": gen,
+            "after_sequence": 0,
+            "reply": {
+                "id": 1,
+                "code": 0,
+                "method": "get_device_state",
+                "result": {},
+                "Timestamp": timestamp,
+            },
+        }
+
+    client.action = action
+    client.native("get_device_state")
+    with pytest.raises(SurveyError, match=reason):
+        client.native("get_device_state")
