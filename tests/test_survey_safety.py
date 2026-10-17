@@ -129,6 +129,12 @@ def test_preflight_accepts_explicit_idle_or_authorized_preview():
     safety.preflight_state(state(), {"state": "stopped"}, view, allow_preview=True)
 
 
+def test_absent_optional_undervoltage_flag_is_not_invented_as_an_alarm():
+    sample = state()
+    del sample["pi_status"]["is_undervolt"]
+    safety.preflight_state(sample, {"state": "stopped"}, {"View": {"state": "idle"}})
+
+
 def test_pulse_uses_shortest_azimuth_direction_and_is_hardware_bounded():
     axes = {"alt_positive": 90, "az_positive": 180}
     assert safety.pulse_for((40, 359), (40, 1), axes) == {
