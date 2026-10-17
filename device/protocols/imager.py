@@ -1,4 +1,5 @@
 import threading
+import uuid
 import zipfile
 from datetime import datetime
 from enum import Enum
@@ -30,6 +31,9 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
         self.streaming_thread = None
         self.exposure_mode: Optional[ExposureModes] = None
         self._received_frame = 0
+        self._frame_instance = uuid.uuid4().hex
+        self._frame_received_monotonic = 0.0
+        self._frame_kind = None
         self.raw_img = None
         self.raw_img_size: Tuple[Optional[int], Optional[int]] = [None, None]
         self.latest_image = None
@@ -128,6 +132,19 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
         with self.lock:
             return self._received_frame
 
+    def get_survey_frame(self):
+        """Atomic copy of actual camera data and its receive identity."""
+        with self.lock:
+            return {
+                "instance": self._frame_instance,
+                "sequence": self._received_frame,
+                "received_monotonic": self._frame_received_monotonic,
+                "kind": self._frame_kind,
+                "image": None
+                if self.latest_image is None
+                else self.latest_image.copy(),
+            }
+
     def receiving_thread_fn(self):
         self.logger.info("starting image receiving thread")
 
@@ -202,16 +219,16 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
                 return
 
             if data is not None:
-                if _id == 21:  # Preview frame
-                    # print("HANDLE preview frame")
-                    self.handle_preview_frame(width, height, data)
-                elif _id == 23:
-                    # print("HANDLE stack")
-                    self.handle_stack(width, height, data)
-                else:
-                    return
-
-                self._received_frame += 1
+                with self.lock:
+                    if _id == 21:  # Preview frame
+                        self.handle_preview_frame(width, height, data)
+                    elif _id == 23:
+                        self.handle_stack(width, height, data)
+                    else:
+                        return
+                    self._received_frame += 1
+                    self._frame_received_monotonic = monotonic()
+                    self._frame_kind = "preview" if _id == 21 else "stack"
                 if self.raw_img is not None:
                     self.logger.debug(f"read image size={len(self.raw_img)}")
                 # todo : run on message listeners here!
@@ -252,6 +269,8 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
                             self.raw_img = np.copy(image)
                             self.latest_image = self.raw_img
                             self._received_frame += 1
+                            self._frame_received_monotonic = monotonic()
+                            self._frame_kind = "stream"
                             empty_images = 0  # Reset counter...
 
                             if self._received_frame % 100 == 0:
