@@ -57,6 +57,8 @@ expire without movement. Active survey has a 90-minute deadline.
 5. Leave the scope stationary, tracking off. Do not automatically park on error.
    A network failure means physical state may be unconfirmed even after the
    finite pulse should have expired. Inspect status before any subsequent move.
+   Do not stop preview as cleanup: firmware provides no ownership token, so an
+   apparently identical preview may belong to another controller by then.
 
 ## Evidence and limits
 
@@ -70,6 +72,18 @@ calibration provenance, and these conservative labels:
   sampled field. Trees may still obscure part of it.
 - `unknown`: no verified stellar solution; trees, clouds, focus, exposure, and
   other causes are not distinguished automatically.
+
+The bridge verifies two newly **received** frames, not device exposure times:
+this protocol does not expose a verified acquisition timestamp. Buffered images
+cannot independently prove the sampled direction or tree location. The labels
+above come from the separate, fresh stellar solve at verified stationary pointing;
+do not turn a saved image alone into an obstruction measurement.
+
+Survey commands use a dedicated loopback action that disables socket replay.
+Completion evidence is retained independently of the UI event stream, scoped to
+the current connection, and anchored after the accepted command's device timestamp.
+Plate solves must also show a new working/start event. Reconnection invalidates
+pending proof; it never restarts a movement automatically.
 
 Unmeasured directions remain unknown. The camera frames can support a private
 visual review of tree silhouettes, but no automatic tree classification is

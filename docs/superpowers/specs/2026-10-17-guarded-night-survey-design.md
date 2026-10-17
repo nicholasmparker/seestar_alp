@@ -12,7 +12,7 @@ This is a new control feature. Implementation is inline with independent review.
 
 The first pass samples 12 azimuths at altitudes 60, 40, and 20 degrees. It is
 not a continuous panorama or a leaf-edge horizon mask. Each sample contains a
-fresh private camera image, measured pointing, and a fresh plate-solve outcome.
+newly received private camera image, measured pointing, and a fresh plate-solve outcome.
 Successful solving means stars were detected in that field; it does not prove
 the entire field is unobstructed. Failed solving means unknown, not trees.
 Unsampled areas remain unknown. No automatic interpolation or observing
@@ -28,7 +28,9 @@ in the retained frames; the runner does not fabricate this classification.
 - A small loopback-only ALP snapshot action returns actual raw preview frames
   and freshness metadata, never loading placeholders or annotated MJPEG frames.
   Image bodies are never logged. A process instance id plus frame sequence
-  distinguishes restarts; a frame must arrive after the capture request.
+  distinguishes restarts; a frame must arrive after the capture request. Device
+  exposure timestamps are unavailable: image-to-pointing correlation remains
+  explicitly unverified, and images alone cannot establish obstructions.
 - The runner has read-only `preflight`, bounded `run`, background `start`,
   `status`, and cooperative `stop`. It owns a private run directory, process
   lock, manifest, and images. No raw native-state dumps, credentials, or site
@@ -63,7 +65,9 @@ cross-axis motion, idle state, and progress after each pulse. Reject >4 degrees
 per pulse, wrong direction, stalled motion, or unexpected position/state.
 Targets stay 20..65 degrees altitude. No park on error; leave stationary with
 tracking off and report any inability to confirm that state. Final cleanup may
-stop only preview/tracking that this run started. Unknown external activity
+stop only preview/tracking that this run started. Since the firmware provides no
+preview ownership token, leave preview running instead of guessing ownership.
+Unknown external activity
 causes a stop, not a takeover.
 
 ## Pointing calibration and image evidence
@@ -82,7 +86,10 @@ Check later successful solves against expected pointing and abort on drift.
 
 For each capture: verify arrival twice, stop tracking, wait for settling, require
 a newly received camera frame, then request a fresh plate solve and correlate
-the new PlateSolve event by its timestamp. Cached events cannot pass. Record
+the new PlateSolve event by its timestamp. Cached events cannot pass. Use a
+connection-scoped immutable receipt journal, new command device timestamps,
+and new solve-start evidence rather than the UI's latest-event cache. Never
+replay a survey command after an attempted socket send. Record
 actual coordinates and FOV, not just requested coordinates. Save incremental
 results so cancellation leaves a truthful partial run.
 

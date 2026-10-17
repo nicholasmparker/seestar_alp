@@ -27,6 +27,8 @@ from pyhocon import ConfigFactory
 from device.abstract_device import MessageParams, StartStackParams, Schedule
 from device.config import Config
 from device.version import Version  # type: ignore
+from device.survey_transport import SurveyReceipts
+from device.survey_safety import SurveyError
 from device.seestar_util import Util
 from device.event_callbacks import *
 
@@ -52,6 +54,7 @@ def _rpc_log_value(data, method=None):
         "get_verify_str",
         "verify_client",
         "pi_is_verified",
+        "get_device_state",
     ):
         parsed = parsed if isinstance(parsed, dict) else {}
         return {
@@ -194,6 +197,7 @@ class Seestar:
         # theoretical race. Value-only mutations of already-existing keys don't need
         # this (dict size doesn't change), so most call sites are left as-is.
         self.event_state_lock = threading.Lock()
+        self.survey_receipts = SurveyReceipts()
 
         self.event_state: dict[str, Any] = {}
         self.update_scheduler_state_obj({}, result=0)
@@ -498,7 +502,7 @@ class Seestar:
         #    json_message("test_connection")
         self.json_message("scope_get_equ_coord", id=420)
 
-    def send_message(self, data):
+    def send_message(self, data, *, replay_on_error=True):
         try:
             if self.s is None:
                 self.logger.warning("socket not initialized!")
@@ -516,7 +520,7 @@ class Seestar:
             # Don't bother trying to recover if watch events is False
             self.logger.debug(f"Send socket error: {e}")
             self.disconnect()
-            if self.is_watch_events and self.reconnect():
+            if replay_on_error and self.is_watch_events and self.reconnect():
                 return self.send_message(data)
             return False
         except Exception:
@@ -536,6 +540,7 @@ class Seestar:
     def disconnect(self) -> None:
         # Disconnect tries to clean up the socket if it exists
         self.is_connected = False
+        self.survey_receipts.reset()
         # A fresh socket must re-authenticate; auth state is per-connection.
         self.is_authenticated = False
         # The auth-gap tracking below is also per-connection: a fresh socket
@@ -708,9 +713,14 @@ class Seestar:
         # aren't lost.
         msg_remainder = self._auth_leftover
         self._auth_leftover = ""
+        buffer_generation = self.survey_receipts.cursor()["generation"]
         while self.is_watch_events:
             threading.current_thread().last_run = datetime.now()
             # print("checking for msg")
+            received_generation = self.survey_receipts.cursor()["generation"]
+            if received_generation != buffer_generation:
+                msg_remainder = ""
+                buffer_generation = received_generation
             data = self.get_socket_msg()
             if data:
                 msg_remainder += data
@@ -740,6 +750,7 @@ class Seestar:
 
                     elif "Event" in parsed_data:
                         # add parsed_data
+                        self.survey_receipts.record(parsed_data, received_generation)
                         self.event_queue.append(parsed_data)
                         self.eventbus.send(parsed_data)
 
@@ -806,13 +817,16 @@ class Seestar:
         json_data = json.dumps(data)
         self.send_message(json_data + "\r\n")
 
-    def send_message_param(self, data: MessageParams) -> int:
+    def send_message_param(self, data: MessageParams, *, replay_on_error=True) -> int:
         data = self.transform_message_for_verify(data)
         cur_cmdid = data.get("id") or self.cmdid
         data["id"] = cur_cmdid
         self.cmdid += 1  # can this overflow?  not in JSON...
         json_data = json.dumps(data)
-        self.send_message(json_data + "\r\n")
+        if replay_on_error:
+            self.send_message(json_data + "\r\n")
+        elif not self.send_message(json_data + "\r\n", replay_on_error=False):
+            raise SurveyError("transport_uncertain")
         return cur_cmdid
 
     def should_inject_verify(self) -> bool:
@@ -873,7 +887,7 @@ class Seestar:
         )
         self.send_message_param(data)
 
-    def send_message_param_sync(self, data: MessageParams):
+    def send_message_param_sync(self, data: MessageParams, *, replay_on_error=True):
         if data["method"] == "pi_shutdown" or data["method"] == "pi_reboot":
             threading.Thread(
                 name=f"shutdown-thread:{self.device_name}",
@@ -884,12 +898,17 @@ class Seestar:
                 "result": "Sent command async for these types of commands.",
             }
         else:
-            cur_cmdid = self.send_message_param(data)
+            cur_cmdid = (
+                self.send_message_param(data)
+                if replay_on_error
+                else self.send_message_param(data, replay_on_error=False)
+            )
 
-        start = time.time()
+        now_fn = time.time if replay_on_error else time.monotonic
+        start = now_fn()
         last_slow = start
         while cur_cmdid not in self.response_dict:
-            now = time.time()
+            now = now_fn()
             if now - last_slow > 2:
                 elapsed = now - start
                 last_slow = now
@@ -3344,7 +3363,7 @@ class Seestar:
                 if len(self.event_queue) == 0:
                     time.sleep(0.1)
                     continue
-                event = self.event_queue.popleft()
+                event = copy.deepcopy(self.event_queue.popleft())
                 try:
                     del event["Timestamp"]  # Safety first...
                 except Exception:
