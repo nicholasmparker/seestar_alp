@@ -66,7 +66,7 @@ def preflight_state(state, schedule, view, *, allow_preview=False):
         not number(battery)
         or not 20 <= battery <= 100
         or power.get("is_overtemp") is not False
-        or power.get("is_undervolt") is not False
+        or power.get("is_undervolt") not in (None, False)
     ):
         raise SurveyError("unsafe_or_unknown_power")
     if schedule.get("state") not in ("stopped", "complete", "idle"):

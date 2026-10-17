@@ -46,7 +46,11 @@ No daytime survey. Require the Sun below -40 degrees and an alt-az mount
 with fresh level error <=1 degree; the accepted hardware optical-axis envelope
 is -5 through 90 degrees. Primary-camera half-diagonal must be <=3 degrees.
 This provides at least 32 degrees center-to-optical-field clearance over the
-entire accepted envelope, independent of heading calibration. Recheck current
+accepted above-horizon envelope, independent of heading calibration. Do not
+apply that mechanical envelope to the folded arm: unfolding is permitted only
+in the same deep-night, ground-based tripod setup, where Earth occludes direct
+sunlight regardless of folded-optics orientation. No daytime unfolding is
+authorized by this tool. Recheck current
 Sun altitude before every motion and periodically while waiting. No bypass.
 If the device/model cannot support that envelope, reject rather than assume.
 
@@ -69,7 +73,10 @@ status.py, and native equatorial coordinates. Convert coordinates using current
 private device site and UTC (FK5 equinox-of-date for native RA/Dec). Internal
 coordinate agreement is not calibration. Require two fresh stellar plate solves
 at high altitude, at separated headings, to derive/check a small pointing
-offset (agreement <=1 degree); require fresh level <=1 degree. Do not silently
+offset (agreement <=1 degree); require fresh level <=1 degree. An azimuth offset
+is applied only in the survey coordinate model, never written to the mount.
+The altitude offset must be <=1 degree and is retained in measured coordinates;
+native altitude rows remain 20, 40, 60 degrees. Do not silently
 sync the mount or use guessed pointing. A failed calibration aborts collection.
 Check later successful solves against expected pointing and abort on drift.
 
