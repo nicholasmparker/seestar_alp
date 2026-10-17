@@ -1,5 +1,6 @@
 import collections
 import json
+import logging
 import socket
 import time
 from types import SimpleNamespace
@@ -2801,6 +2802,194 @@ class _AuthFakeSocket:
 
     def close(self):
         pass
+
+
+@pytest.mark.parametrize(
+    "verify_reply",
+    [
+        {"code": 0, "result": {"key_envelope": "TEST-ONLY-ENVELOPE"}},
+        {"code": 0},
+        {"result": 0},
+        {"code": 0, "result": 0},
+    ],
+)
+def test_authenticate_accepts_success_reply_shapes(monkeypatch, seestar, verify_reply):
+    """A successful status code must not be shadowed by a newer result object."""
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "TEST-SIGNATURE")
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "TEST-CHALLENGE"}},
+            {"method": "verify_client", **verify_reply},
+            {"method": "pi_is_verified", "code": 0, "result": True},
+        ]
+    )
+
+    assert seestar.authenticate() is True
+    assert [json.loads(p)["method"] for p in seestar.s.sent] == [
+        "get_verify_str",
+        "verify_client",
+        "pi_is_verified",
+    ]
+
+
+@pytest.mark.parametrize(
+    "verify_reply",
+    [
+        {"code": 210, "result": 0, "error": "not supported"},
+        {"code": 210, "result": 0},
+        {"code": 0, "error": "rejected"},
+        {"result": False},
+        {},
+    ],
+)
+def test_authenticate_rejects_error_even_with_zero_result(
+    monkeypatch, seestar, verify_reply
+):
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "TEST-SIGNATURE")
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "TEST-CHALLENGE"}},
+            {"method": "verify_client", **verify_reply},
+            {"method": "pi_is_verified", "code": 0, "result": True},
+        ]
+    )
+
+    assert seestar.authenticate() is False
+    assert len(seestar.s.sent) == 2
+
+
+@pytest.mark.parametrize(
+    "confirmed", [False, None, {"is_verified": False}, {"is_verified": "false"}]
+)
+def test_authenticate_envelope_requires_verified_device(
+    monkeypatch, seestar, confirmed
+):
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "TEST-SIGNATURE")
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "TEST-CHALLENGE"}},
+            {
+                "method": "verify_client",
+                "code": 0,
+                "result": {"key_envelope": "TEST-ONLY-ENVELOPE"},
+            },
+            {"method": "pi_is_verified", "code": 0, "result": confirmed},
+        ]
+    )
+
+    assert seestar.authenticate() is False
+    assert len(seestar.s.sent) == 3
+
+
+def test_authenticate_does_not_log_handshake_payloads(monkeypatch, seestar, caplog):
+    seestar.logger = logging.getLogger("test.auth.redaction")
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "TEST-SIGNATURE")
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "TEST-CHALLENGE"}},
+            {
+                "method": "verify_client",
+                "code": 210,
+                "result": {"key_envelope": "TEST-ONLY-ENVELOPE"},
+            },
+        ]
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        assert seestar.authenticate() is False
+    for secret in ("TEST-CHALLENGE", "TEST-SIGNATURE", "TEST-ONLY-ENVELOPE"):
+        assert secret not in caplog.text
+    assert "verify_client" in caplog.text
+
+
+def test_receive_thread_redacts_auth_but_retains_actual_reply(
+    monkeypatch, seestar, caplog
+):
+    seestar.logger = logging.getLogger("test.auth.redaction")
+    reply = {
+        "jsonrpc": "2.0",
+        "method": "verify_client",
+        "id": 55,
+        "code": 0,
+        "result": {"key_envelope": "TEST-ONLY-ENVELOPE"},
+    }
+
+    def receive_once():
+        seestar.is_watch_events = False
+        return json.dumps(reply) + "\r\n"
+
+    monkeypatch.setattr(seestar, "get_socket_msg", receive_once)
+    seestar.is_watch_events = True
+    with caplog.at_level(logging.DEBUG):
+        seestar.receive_message_thread_fn()
+
+    assert seestar.response_dict[55] == reply
+    assert "TEST-ONLY-ENVELOPE" not in caplog.text
+    assert "verify_client" in caplog.text
+
+
+def test_sync_auth_reply_is_redacted_without_changing_return(
+    monkeypatch, seestar, caplog
+):
+    seestar.logger = logging.getLogger("test.auth.redaction")
+    reply = {
+        "id": 55,
+        "method": "verify_client",
+        "code": 0,
+        "result": {"key_envelope": "TEST-ONLY-ENVELOPE"},
+    }
+    monkeypatch.setattr(seestar, "send_message_param", lambda _d: 55)
+    seestar.response_dict[55] = reply
+    with caplog.at_level(logging.DEBUG):
+        result = seestar.send_message_param_sync({"method": "verify_client"})
+    assert result == reply
+    assert "TEST-ONLY-ENVELOPE" not in caplog.text
+
+
+def test_sync_auth_timeout_redacts_request(monkeypatch, seestar, caplog):
+    seestar.logger = logging.getLogger("test.auth.redaction")
+    monkeypatch.setattr(seestar, "send_message_param", lambda _d: 55)
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    # Logging also reads time.time; a monotonically advancing clock avoids
+    # coupling the test to the number of emitted log messages.
+    import itertools
+
+    ticks = itertools.count(0, 3)
+    monkeypatch.setattr("device.seestar_device.time.time", lambda: next(ticks))
+    with caplog.at_level(logging.DEBUG):
+        result = seestar.send_message_param_sync(
+            {
+                "method": "verify_client",
+                "params": {"sign": "TEST-SIGNATURE", "data": "TEST-CHALLENGE"},
+            }
+        )
+    assert result["result"].startswith("Error:")
+    assert "TEST-SIGNATURE" not in caplog.text
+    assert "TEST-CHALLENGE" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["get_verify_str", "verify_client", "pi_is_verified"]
+)
+def test_authenticate_redacts_replies_without_method(
+    monkeypatch, seestar, caplog, failure_stage
+):
+    seestar.logger = logging.getLogger("test.auth.redaction")
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "TEST-SIGNATURE")
+    replies = []
+    if failure_stage != "get_verify_str":
+        replies.append(
+            {"method": "get_verify_str", "result": {"str": "TEST-CHALLENGE"}}
+        )
+    if failure_stage == "pi_is_verified":
+        replies.append({"method": "verify_client", "code": 0, "result": 0})
+    # Matching request IDs are accepted by the inline RPC reader even when a
+    # firmware reply omits method. The known request must drive redaction.
+    replies.append({"code": 210, "result": {"key_envelope": "TEST-ONLY-ENVELOPE"}})
+    seestar.s = _AuthFakeSocket(replies=replies)
+    with caplog.at_level(logging.DEBUG):
+        assert seestar.authenticate() is False
+    assert "TEST-ONLY-ENVELOPE" not in caplog.text
 
 
 def test_authenticate_succeeds_without_receive_thread(monkeypatch, seestar):
