@@ -191,6 +191,39 @@ def test_two_slow_preview_frames_fit_bounded_capture_window(monkeypatch):
     assert 30 <= clock[0] < 45
 
 
+@pytest.mark.parametrize("failed_method", ["begin_streaming", "stop_streaming"])
+@pytest.mark.parametrize("raises", [False, True])
+def test_uncertain_subscription_send_fails_closed_without_retry(
+    monkeypatch, failed_method, raises
+):
+    camera = Camera()
+    clock = [4.0]
+    monkeypatch.setattr(survey_snapshot.time, "monotonic", lambda: clock[0])
+
+    def advance(_):
+        clock[0] += 1
+        camera.seq += 1
+
+    def send(message):
+        camera.messages.append(message)
+        if json.loads(message)["method"] == failed_method:
+            if raises:
+                raise OSError("PRIVATE_TRANSPORT_DETAILS")
+            return False
+        return True
+
+    monkeypatch.setattr(survey_snapshot.time, "sleep", advance)
+    camera.send_message = send
+    with pytest.raises(SurveyError, match="^camera_stream_uncertain$"):
+        survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=5)
+    messages = list(camera.messages)
+    # A second capture must not silently adopt or retry an uncertain stream.
+    with pytest.raises(SurveyError, match="^camera_stream_uncertain$"):
+        survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=5)
+    assert camera.messages == messages
+    assert sum(json.loads(x)["method"] == failed_method for x in messages) == 1
+
+
 @pytest.mark.parametrize("address", ["192.0.2.1", "localhost", "", None])
 def test_route_refuses_nonloopback_even_when_forwarded_headers_claim_local(
     address, monkeypatch
