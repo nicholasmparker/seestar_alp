@@ -18,9 +18,13 @@ def snapshot(imager, timeout=SNAPSHOT_TIMEOUT_SECONDS):
     if not number(timeout) or not 0 < timeout <= SNAPSHOT_TIMEOUT_SECONDS:
         raise SurveyError("invalid_snapshot_timeout")
     comm = imager.comm
+    with comm.survey_preview():
+        return _capture(comm, timeout)
+
+
+def _capture(comm, timeout):
     baseline = comm.get_survey_frame()
     started = time.monotonic()
-    comm.set_exposure_mode("preview")
     while time.monotonic() - started < timeout:
         current = comm.get_survey_frame()
         if current["instance"] != baseline["instance"]:

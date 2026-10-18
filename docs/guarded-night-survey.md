@@ -56,6 +56,10 @@ expire without movement. Active survey has a 90-minute deadline.
    and collect a fresh plate-solve outcome. Save results incrementally.
    Allow up to 45 seconds for two newly received full-resolution preview frames;
    this remains bounded and does not relax freshness or motion checks.
+   Release a temporary image-stream subscription after capture or failure, so
+   full-resolution frames do not congest the control link between samples.
+   Preserve existing image viewers and any viewer that takes over during capture;
+   this subscription cleanup does not stop the telescope's observing mode.
 5. Leave the scope stationary, tracking off. Do not automatically park on error.
    A network failure means physical state may be unconfirmed even after the
    finite pulse should have expired. Inspect status before any subsequent move.
