@@ -64,8 +64,15 @@ level, authentication, ownership, no-replay, and finite-motion gates are unchang
 Open exactly once using `scope_move_to_horizon`; verify fresh native close=false
 and idle plus a new matching completion event. A timeout is unconfirmed and
 must not be blindly retried. After opening, movement uses only finite
-`scope_speed_move` pulses (speed <=4000, duration <=2 seconds), never an
-unbounded goto. Calibrate axis signs with one-second pulses. Check displacement,
+`scope_speed_move` pulses (speed <=240, duration <=2 seconds), never an
+unbounded goto. Native speed is 15-arcsecond steps/second; 240 is nominal
+1 degree/second, not 240 arcseconds/second
+(https://seestarpy.readthedocs.io/en/stable/api/raw.html).
+Calibrate axis signs with speed 120 one-second pulses; fine moves use 60.
+This corrects the original 4000/1000 unit error without widening the measured
+motion envelope. Record attempted/bounded-verified counts and the first three
+pulse deltas in the private manifest; uncertain attempts remain unverified.
+Check displacement,
 cross-axis motion, idle state, and progress after each pulse. Reject >4 degrees
 per pulse, wrong direction, stalled motion, or unexpected position/state.
 Targets stay 20..65 degrees altitude. No park on error; leave stationary with

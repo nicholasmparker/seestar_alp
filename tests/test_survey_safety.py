@@ -145,18 +145,24 @@ def test_absent_optional_undervoltage_flag_is_not_invented_as_an_alarm():
 def test_pulse_uses_shortest_azimuth_direction_and_is_hardware_bounded():
     axes = {"alt_positive": 90, "az_positive": 180}
     assert safety.pulse_for((40, 359), (40, 1), axes) == {
-        "speed": 4000,
+        "speed": 240,
         "angle": 180,
         "dur_sec": 1,
     }
     assert safety.pulse_for((40, 1), (40, 359), axes) == {
-        "speed": 4000,
+        "speed": 240,
         "angle": 0,
         "dur_sec": 1,
     }
     pulse = safety.pulse_for((20, 0), (60, 270), axes)
-    assert pulse == {"speed": 4000, "angle": 90, "dur_sec": 2}
+    assert pulse == {"speed": 240, "angle": 90, "dur_sec": 2}
     assert safety.pulse_for((40, 1), (40.2, 1.2), axes) is None
+
+
+def test_fine_pulse_uses_quarter_degree_per_second_native_rate():
+    assert safety.pulse_for(
+        (40, 1), (41, 1), {"alt_positive": 90, "az_positive": 180}
+    ) == {"speed": 60, "angle": 90, "dur_sec": 1}
 
 
 @pytest.mark.parametrize("target", [(19, 10), (66, 10), (20, math.nan), (20, 361)])
