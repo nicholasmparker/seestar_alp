@@ -40,9 +40,14 @@ The runner checks authentication, synchronized host/device clocks, private
 device site, mount state, scheduler state, battery/thermal warnings, level,
 main-camera geometry, and Sun altitude. Firmware 9.75 does not expose an
 undervoltage flag in the observed state; if present and asserted, it is refused.
-No gate has a force/bypass flag. Sun must be below -40 degrees; this is
-intentionally more restrictive than ordinary twilight. A four-hour wait may
-expire without movement. Active survey has a 90-minute deadline.
+No gate has a force/bypass flag. Sun must be strictly below -18 degrees
+(astronomical night), checked before opening and every movement. This is a
+darkness criterion for the stellar survey, not a requirement for 30-degree
+angular separation from a Sun already occluded by Earth. The safety argument
+requires the confirmed ground-based tripod setup, including during unfolding;
+it does not authorize daytime, airborne, or a moved setup. This replaces the
+unnecessarily restrictive -40-degree rule. A four-hour wait may expire without
+movement. Active survey has a 90-minute deadline.
 
 ## What happens
 
