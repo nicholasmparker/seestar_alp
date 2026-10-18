@@ -1,6 +1,7 @@
 import threading
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
@@ -16,6 +17,7 @@ from device.processors.image_processor import ImageProcessor
 from device.protocols.binary import SeestarBinaryProtocol
 from device.protocols.socket_base import SocketListener
 from device.rtspclient import RtspClient
+from device.survey_safety import SurveyError
 
 ExposureModes = Enum("ExposureModes", ["stream", "preview", "stacking"])
 
@@ -30,6 +32,9 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
         self.receiving_thread = None
         self.streaming_thread = None
         self.exposure_mode: Optional[ExposureModes] = None
+        self._exposure_revision = 0
+        self._survey_snapshot_lock = threading.Lock()
+        self._survey_stream_uncertain = False
         self._received_frame = 0
         self._frame_instance = uuid.uuid4().hex
         self._frame_received_monotonic = 0.0
@@ -65,14 +70,14 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
             return self._is_started and self.exposure_mode == "stream"
 
     def start_preview(self):
-        self.send_message('{"id": 21, "method": "begin_streaming"}' + "\r\n")
+        return self.send_message('{"id": 21, "method": "begin_streaming"}' + "\r\n")
 
     def stop_preview(self):
         with self.lock:
             self.raw_img = None
             self.raw_img_size = [None, None]
 
-        self.send_message('{"id": 22, "method": "stop_streaming"}' + "\r\n")
+        return self.send_message('{"id": 22, "method": "stop_streaming"}' + "\r\n")
 
     def start(self):
         super().start()
@@ -106,6 +111,9 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
 
     def set_exposure_mode(self, exposure_mode: ExposureModes):
         with self.lock:
+            # Even an unchanged mode is a new consumer claim. A temporary
+            # survey subscription must not stop a viewer that arrived later.
+            self._exposure_revision += 1
             # print(f"CHANGING exposure mode to {exposure_mode} from {self.exposure_mode}")
             if self.exposure_mode != exposure_mode:
                 if exposure_mode == "preview":
@@ -113,6 +121,52 @@ class SeestarImagerProtocol(SeestarBinaryProtocol):
                 else:
                     self.stop_preview()
             self.exposure_mode = exposure_mode
+
+    @contextmanager
+    def survey_preview(self):
+        """Borrow preview frames without leaking or taking over a subscription.
+
+        This controls only ALP's image-socket subscription, never the device's
+        observing mode. Existing viewers retain their subscription.
+        """
+        if not self._survey_snapshot_lock.acquire(blocking=False):
+            raise SurveyError("camera_snapshot_busy")
+        owned_revision = None
+        try:
+            with self.lock:
+                if self._survey_stream_uncertain:
+                    raise SurveyError("camera_stream_uncertain")
+                if self.exposure_mode not in (None, "preview"):
+                    raise SurveyError("camera_stream_busy")
+                if self.exposure_mode is None:
+                    self._set_survey_preview(True)
+                    owned_revision = self._exposure_revision
+            yield
+        finally:
+            try:
+                with self.lock:
+                    if (
+                        owned_revision is not None
+                        and self._exposure_revision == owned_revision
+                        and self.exposure_mode == "preview"
+                    ):
+                        self._set_survey_preview(False)
+            finally:
+                self._survey_snapshot_lock.release()
+
+    def _set_survey_preview(self, enabled):
+        # Called only under self.lock. Do not claim a transition when the
+        # sender knows delivery failed; refuse future snapshots until restart.
+        self._survey_stream_uncertain = True
+        self._exposure_revision += 1
+        try:
+            sent = self.start_preview() if enabled else self.stop_preview()
+        except Exception:
+            raise SurveyError("camera_stream_uncertain") from None
+        if sent is not True:
+            raise SurveyError("camera_stream_uncertain")
+        self.exposure_mode = "preview" if enabled else None
+        self._survey_stream_uncertain = False
 
     def get_image(self) -> Tuple[Optional[np.ndarray], Optional[int], Optional[int]]:
         with self.lock:
