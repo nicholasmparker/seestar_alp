@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 from types import SimpleNamespace
 
@@ -37,20 +38,22 @@ def test_protocol_records_actual_frame_freshness_atomically(monkeypatch):
     assert proto.get_survey_frame()["image"].max() > 0
 
 
-class Camera:
+class Camera(SeestarImagerProtocol):
     def __init__(self):
+        super().__init__(logging.getLogger("snapshot-test"), "test", 1, "127.0.0.1", 1)
         self.seq = 4
-        self.mode = None
+        self.messages = []
 
-    def set_exposure_mode(self, mode):
-        self.mode = mode
+    def send_message(self, message):
+        self.messages.append(message)
+        return True
 
     def get_survey_frame(self):
         return {
             "instance": "test-instance",
             "sequence": self.seq,
             "received_monotonic": float(self.seq),
-            "kind": "preview",
+            "kind": self.exposure_mode,
             "image": np.full((16, 16, 3), self.seq, dtype=np.uint8),
         }
 
@@ -74,17 +77,95 @@ def test_snapshot_discards_inflight_frame_then_returns_new_pixels(monkeypatch):
     )
     assert decoded.shape == (16, 16, 3)
     assert int(decoded[0, 0, 0]) == 6
-    assert camera.mode == "preview"
+    assert camera.exposure_mode is None
+    assert [json.loads(x)["method"] for x in camera.messages] == [
+        "begin_streaming",
+        "stop_streaming",
+    ]
 
 
 def test_snapshot_does_not_serve_cached_or_missing_frame(monkeypatch):
+    camera = Camera()
     clock = [4.0]
     monkeypatch.setattr(survey_snapshot.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
         survey_snapshot.time, "sleep", lambda _: clock.__setitem__(0, clock[0] + 1)
     )
     with pytest.raises(SurveyError, match="fresh_frame_timeout"):
-        survey_snapshot.snapshot(SimpleNamespace(comm=Camera()), timeout=2)
+        survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=2)
+    assert camera.exposure_mode is None
+    assert [json.loads(x)["method"] for x in camera.messages] == [
+        "begin_streaming",
+        "stop_streaming",
+    ]
+
+
+@pytest.mark.parametrize("takeover_mode", ["preview", "stream"])
+def test_snapshot_cleanup_does_not_stop_a_new_viewer(monkeypatch, takeover_mode):
+    camera = Camera()
+    clock = [4.0]
+    monkeypatch.setattr(survey_snapshot.time, "monotonic", lambda: clock[0])
+
+    def advance(_):
+        clock[0] += 1
+        camera.seq += 1
+        camera.set_exposure_mode(takeover_mode)
+
+    monkeypatch.setattr(survey_snapshot.time, "sleep", advance)
+    if takeover_mode == "stream":
+        with pytest.raises(SurveyError, match="fresh_frame_timeout"):
+            survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=5)
+    else:
+        survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=5)
+    assert camera.exposure_mode == takeover_mode
+
+
+def test_snapshot_does_not_release_existing_preview(monkeypatch):
+    camera = Camera()
+    camera.set_exposure_mode("preview")
+    clock = [4.0]
+    monkeypatch.setattr(survey_snapshot.time, "monotonic", lambda: clock[0])
+
+    def advance(_):
+        clock[0] += 1
+        camera.seq += 1
+
+    monkeypatch.setattr(survey_snapshot.time, "sleep", advance)
+    survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=5)
+    assert camera.exposure_mode == "preview"
+    assert len(camera.messages) == 1
+
+
+@pytest.mark.parametrize("mode", ["stream", "stack"])
+def test_snapshot_refuses_to_replace_another_stream_mode(mode):
+    camera = Camera()
+    camera.set_exposure_mode(mode)
+    before = list(camera.messages)
+    with pytest.raises(SurveyError, match="camera_stream_busy"):
+        survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=1)
+    assert camera.exposure_mode == mode
+    assert camera.messages == before
+
+
+def test_concurrent_snapshot_cannot_borrow_another_snapshots_temporary_stream(
+    monkeypatch,
+):
+    camera = Camera()
+    clock = [4.0]
+    monkeypatch.setattr(survey_snapshot.time, "monotonic", lambda: clock[0])
+    attempted = []
+
+    def advance(_):
+        if not attempted:
+            attempted.append(True)
+            with pytest.raises(SurveyError, match="camera_snapshot_busy"):
+                survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=1)
+        clock[0] += 1
+        camera.seq += 1
+
+    monkeypatch.setattr(survey_snapshot.time, "sleep", advance)
+    survey_snapshot.snapshot(SimpleNamespace(comm=camera), timeout=5)
+    assert camera.exposure_mode is None
 
 
 def test_two_slow_preview_frames_fit_bounded_capture_window(monkeypatch):
