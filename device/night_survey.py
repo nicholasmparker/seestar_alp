@@ -28,6 +28,8 @@ from astropy.utils import iers
 
 from device.survey_safety import (
     SNAPSHOT_TIMEOUT_SECONDS,
+    SURVEY_CALIBRATION_SPEED,
+    SURVEY_MAX_SPEED,
     SurveyError,
     az_delta,
     fresh_terminal,
@@ -476,11 +478,17 @@ class SurveyRunner:
             or type(params.get("dur_sec")) is not int
             or not 1 <= params["dur_sec"] <= 2
             or type(params.get("speed")) is not int
-            or not 1 <= params["speed"] <= 4000
+            or not 1 <= params["speed"] <= SURVEY_MAX_SPEED
         ):
             raise SurveyError("invalid_motion_pulse")
         self.motion_gate()
         before = self.position()
+        evidence = self.manifest.setdefault(
+            "motion_evidence",
+            {"attempted": 0, "bounded_verified": 0, "first_verified_pulses": []},
+        )
+        evidence["attempted"] += 1
+        self.save()
         try:
             self.client.native("scope_speed_move", params)
         finally:
@@ -491,11 +499,28 @@ class SurveyRunner:
         after = self.position()
         if abs(after[0] - before[0]) > 4 or abs(az_delta(before[1], after[1])) > 4:
             raise SurveyError("pulse_exceeded_envelope")
+        # Bounded displacement plus fresh idle state, not a claim of axis or
+        # stellar calibration. Preserve a small evidence sample, never raw state.
+        evidence["bounded_verified"] += 1
+        if len(evidence["first_verified_pulses"]) < 3:
+            evidence["first_verified_pulses"].append(
+                {
+                    **params,
+                    "delta_alt_az": [
+                        after[0] - before[0],
+                        az_delta(before[1], after[1]),
+                    ],
+                }
+            )
+        evidence["last_verified_at"] = self.clock.now().isoformat()
+        self.save()
         return before, after
 
     def calibrate_axes(self):
         for angle in (90, 270):
-            before, after = self.pulse({"speed": 4000, "angle": angle, "dur_sec": 1})
+            before, after = self.pulse(
+                {"speed": SURVEY_CALIBRATION_SPEED, "angle": angle, "dur_sec": 1}
+            )
             delta = after[0] - before[0]
             if abs(az_delta(before[1], after[1])) > 0.3:
                 raise SurveyError("unexpected_axis_coupling")
@@ -504,7 +529,9 @@ class SurveyRunner:
                 break
         else:
             raise SurveyError("altitude_axis_did_not_respond")
-        before, after = self.pulse({"speed": 4000, "angle": 0, "dur_sec": 1})
+        before, after = self.pulse(
+            {"speed": SURVEY_CALIBRATION_SPEED, "angle": 0, "dur_sec": 1}
+        )
         delta = az_delta(before[1], after[1])
         if abs(after[0] - before[0]) > 0.3 or abs(delta) < 0.03:
             raise SurveyError("azimuth_axis_did_not_respond")

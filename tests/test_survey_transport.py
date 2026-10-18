@@ -15,6 +15,24 @@ def scope():
     return Seestar(logging.getLogger("survey-transport"), "127.0.0.1", 1, "test", 1)
 
 
+@pytest.mark.parametrize("speed", [241, 1000, 4000])
+def test_transport_rejects_overspeed_before_native_sender(speed, monkeypatch):
+    device = scope()
+    sent = []
+    monkeypatch.setattr(
+        device, "send_message_param_sync", lambda *a, **k: sent.append(a)
+    )
+    with pytest.raises(SurveyError, match="invalid_motion_pulse"):
+        survey_transport.command(
+            device,
+            {
+                "method": "scope_speed_move",
+                "params": {"speed": speed, "angle": 90, "dur_sec": 1},
+            },
+        )
+    assert sent == []
+
+
 def test_attempted_survey_mutation_never_replays_after_send_error(monkeypatch):
     device = scope()
     delivered = []
