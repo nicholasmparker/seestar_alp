@@ -6,11 +6,16 @@ import time
 
 import cv2
 
-from device.survey_safety import SurveyError, native_result, number
+from device.survey_safety import (
+    SNAPSHOT_TIMEOUT_SECONDS,
+    SurveyError,
+    native_result,
+    number,
+)
 
 
-def snapshot(imager, timeout=12):
-    if not number(timeout) or not 0 < timeout <= 12:
+def snapshot(imager, timeout=SNAPSHOT_TIMEOUT_SECONDS):
+    if not number(timeout) or not 0 < timeout <= SNAPSHOT_TIMEOUT_SECONDS:
         raise SurveyError("invalid_snapshot_timeout")
     comm = imager.comm
     baseline = comm.get_survey_frame()
@@ -20,8 +25,8 @@ def snapshot(imager, timeout=12):
         current = comm.get_survey_frame()
         if current["instance"] != baseline["instance"]:
             raise SurveyError("camera_restarted")
-        # One frame may already be exposing when the request arrives. Require
-        # two new frames so that a pre-arrival exposure cannot become evidence.
+        # Discard the first newly received frame. This reduces in-flight-frame
+        # risk, but receipt metadata does not prove device exposure freshness.
         image = current["image"]
         if (
             current.get("kind") == "preview"
@@ -66,4 +71,4 @@ def local_snapshot(remote_addr, device, imager, params):
         raise SurveyError("snapshot_requires_star_preview")
     if imager is None:
         raise SurveyError("camera_unavailable")
-    return snapshot(imager, params.get("timeout", 12))
+    return snapshot(imager, params.get("timeout", SNAPSHOT_TIMEOUT_SECONDS))

@@ -87,6 +87,29 @@ def test_snapshot_does_not_serve_cached_or_missing_frame(monkeypatch):
         survey_snapshot.snapshot(SimpleNamespace(comm=Camera()), timeout=2)
 
 
+def test_two_slow_preview_frames_fit_bounded_capture_window(monkeypatch):
+    camera = Camera()
+    clock = [0.0]
+    monkeypatch.setattr(survey_snapshot.time, "monotonic", lambda: clock[0])
+
+    def advance(seconds):
+        clock[0] += seconds
+        camera.seq = 4 + int(clock[0] / 15)
+
+    monkeypatch.setattr(survey_snapshot.time, "sleep", advance)
+    original = camera.get_survey_frame
+
+    def frame():
+        result = original()
+        result["received_monotonic"] = (camera.seq - 4) * 15.0
+        return result
+
+    camera.get_survey_frame = frame
+    image = survey_snapshot.snapshot(SimpleNamespace(comm=camera))
+    assert image["sequence"] == 6
+    assert 30 <= clock[0] < 45
+
+
 @pytest.mark.parametrize("address", ["192.0.2.1", "localhost", "", None])
 def test_route_refuses_nonloopback_even_when_forwarded_headers_claim_local(
     address, monkeypatch

@@ -27,6 +27,7 @@ from astropy.time import Time
 from astropy.utils import iers
 
 from device.survey_safety import (
+    SNAPSHOT_TIMEOUT_SECONDS,
     SurveyError,
     az_delta,
     fresh_terminal,
@@ -188,7 +189,8 @@ class SurveyClient:
         ).encode()
         try:
             request = urllib.request.Request(self.url, data=data, method="PUT")
-            with self.opener.open(request, timeout=18) as response:
+            timeout = SNAPSHOT_TIMEOUT_SECONDS + 15 if name == "survey_snapshot" else 18
+            with self.opener.open(request, timeout=timeout) as response:
                 body = response.read(64 * 1024 * 1024 + 1)
             if len(body) > 64 * 1024 * 1024:
                 raise SurveyError("response_too_large")
@@ -594,7 +596,9 @@ class SurveyRunner:
 
     def capture(self, index, target):
         measured = self.move_to((target[0], (target[1] - self.offset[1]) % 360))
-        image = self.client.action("survey_snapshot", {"timeout": 12})
+        image = self.client.action(
+            "survey_snapshot", {"timeout": SNAPSHOT_TIMEOUT_SECONDS}
+        )
         after = self.position()
         if (
             abs(after[0] - measured[0]) > 0.3

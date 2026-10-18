@@ -54,6 +54,8 @@ expire without movement. Active survey has a 90-minute deadline.
 4. Visit the requested part of a 12-heading by 3-altitude grid. At each position,
    settle, require two new preview frames, bracket capture with pointing reads,
    and collect a fresh plate-solve outcome. Save results incrementally.
+   Allow up to 45 seconds for two newly received full-resolution preview frames;
+   this remains bounded and does not relax freshness or motion checks.
 5. Leave the scope stationary, tracking off. Do not automatically park on error.
    A network failure means physical state may be unconfirmed even after the
    finite pulse should have expired. Inspect status before any subsequent move.
