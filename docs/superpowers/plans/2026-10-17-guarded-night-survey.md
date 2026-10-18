@@ -14,7 +14,9 @@ commands are used; no device-native service or extra credential handling.
 
 ## Global Constraints
 
-- Sun below -40 degrees; primary half-FOV <=3 degrees; level <=1 degree.
+- Sun strictly below -18 degrees for the confirmed ground-based tripod setup
+  (user-approved 2026-10-17 correction from -40); primary half-FOV <=3 degrees;
+  level <=1 degree. Earth occlusion, not angular clearance, protects unfolding.
 - Native integer id/code=0/method validation; finite numbers exclude booleans.
 - Pulse speed <=4000 and duration <=2 seconds; displacement <=4 degrees.
 - Targets 20..65 degrees; 12 headings x 3 altitude rows; all gaps unknown.

@@ -231,6 +231,28 @@ def test_preflight_and_missing_clearance_never_send_motion(tmp_path):
     assert scope.writes == []
 
 
+def test_astronomical_night_opens_once_then_refuses_pulse_at_dawn(tmp_path, monkeypatch):
+    # Catches the old -40 refusal and removal of the per-pulse dawn check.
+    run, scope, _ = runner(tmp_path)
+    monkeypatch.setattr(survey, "solar_altitude", lambda site, now: -24.36)
+    run.open_arm()
+    assert scope.state["mount"]["close"] is False
+    assert scope.writes == [("scope_move_to_horizon", None)]
+    monkeypatch.setattr(survey, "solar_altitude", lambda site, now: -18.0)
+    with pytest.raises(SurveyError, match="waiting_for_safe_darkness"):
+        run.pulse({"speed": 1000, "angle": 90, "dur_sec": 1})
+    assert scope.writes == [("scope_move_to_horizon", None)]
+
+
+@pytest.mark.parametrize("sun", [-18.0, -17.99, 0.0])
+def test_twilight_never_opens_arm(tmp_path, monkeypatch, sun):
+    run, scope, _ = runner(tmp_path)
+    monkeypatch.setattr(survey, "solar_altitude", lambda site, now: sun)
+    with pytest.raises(SurveyError, match="waiting_for_safe_darkness"):
+        run.open_arm()
+    assert scope.writes == []
+
+
 def test_unsafe_state_never_sends_motion(tmp_path):
     run, scope, _ = runner(tmp_path)
     scope.state["mount"]["tracking"] = True
