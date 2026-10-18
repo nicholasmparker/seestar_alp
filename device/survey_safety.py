@@ -2,6 +2,8 @@
 
 import math
 
+SNAPSHOT_TIMEOUT_SECONDS = 45
+
 
 class SurveyError(RuntimeError):
     """A stable, sanitized failure code; never pass raw device payloads here."""

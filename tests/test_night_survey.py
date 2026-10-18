@@ -1,6 +1,7 @@
 import base64
 import copy
 import json
+import io
 import math
 import os
 from datetime import datetime, timezone
@@ -466,3 +467,17 @@ def test_reconnection_or_device_clock_regression_invalidates_whole_client(
     client.native("get_device_state")
     with pytest.raises(SurveyError, match=reason):
         client.native("get_device_state")
+
+
+def test_snapshot_http_deadline_covers_two_slow_frames():
+    client = survey.SurveyClient()
+    timeouts = []
+
+    def open_request(request, timeout):
+        timeouts.append(timeout)
+        return io.BytesIO(b'{"ErrorNumber":0,"Value":{}}')
+
+    client.opener.open = open_request
+    client.action("survey_snapshot")
+    client.action("get_schedule")
+    assert timeouts == [60, 18]
