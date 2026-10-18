@@ -3,6 +3,7 @@
 import math
 
 SNAPSHOT_TIMEOUT_SECONDS = 45
+ASTRONOMICAL_NIGHT_SUN_ALTITUDE_DEG = -18
 
 
 class SurveyError(RuntimeError):
@@ -42,9 +43,15 @@ def horizon(result):
 
 
 def sun_gate(sun_alt, half_fov, level):
+    """Night-only gate for the explicitly cleared, ground-based tripod setup.
+
+    Earth occludes direct sunlight even during unfolding. This is an
+    astronomical-darkness criterion, not an angular Sun-avoidance envelope;
+    it must not be reused to authorize daytime or airborne operation.
+    """
     if not all(number(v) for v in (sun_alt, half_fov, level)):
         raise SurveyError("unknown_sun_envelope")
-    if not -90 <= sun_alt < -40:
+    if not -90 <= sun_alt < ASTRONOMICAL_NIGHT_SUN_ALTITUDE_DEG:
         raise SurveyError("waiting_for_safe_darkness")
     if not 0 < half_fov <= 3 or not 0 <= level <= 1:
         raise SurveyError("unsafe_optics_or_level")

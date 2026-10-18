@@ -67,11 +67,17 @@ def test_horizon_uses_altitude_first_and_accepts_named_fields():
 @pytest.mark.parametrize(
     "sun,fov,level",
     [
-        (-40, 2, 0),
-        (-39.9, 2, 0),
+        (-18, 2, 0),
+        (-17.99, 2, 0),
+        (-0.1, 2, 0),
+        (30, 2, 0),
+        (-90.1, 2, 0),
         (-50, 3.1, 0),
         (-50, 2, 1.1),
         (math.nan, 2, 0),
+        (math.inf, 2, 0),
+        (-math.inf, 2, 0),
+        (False, 2, 0),
         (-50, 0, 0),
         (-50, 2, -1),
         (-50, 2, True),
@@ -82,8 +88,9 @@ def test_sun_gate_rejects_unsafe_unknown_and_boundary(sun, fov, level):
         safety.sun_gate(sun, fov, level)
 
 
-def test_sun_gate_accepts_entire_envelope_at_deep_night():
-    safety.sun_gate(-40.1, 3, 1)
+@pytest.mark.parametrize("sun", [-18.01, -24.36, -40, -90])
+def test_sun_gate_accepts_astronomical_night_for_ground_based_setup(sun):
+    safety.sun_gate(sun, 3, 1)
 
 
 @pytest.mark.parametrize(

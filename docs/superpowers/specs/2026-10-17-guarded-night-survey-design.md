@@ -44,17 +44,22 @@ invalid/unknown optics, low battery/temperature warning, missing physical
 clearance, or failed native authentication. Existing preview may be replaced
 under the user's explicit approval; unrelated observing work may not.
 
-No daytime survey. Require the Sun below -40 degrees and an alt-az mount
+No daytime survey. Require the Sun strictly below -18 degrees and an alt-az mount
 with fresh level error <=1 degree; the accepted hardware optical-axis envelope
 is -5 through 90 degrees. Primary-camera half-diagonal must be <=3 degrees.
-This provides at least 32 degrees center-to-optical-field clearance over the
-accepted above-horizon envelope, independent of heading calibration. Do not
-apply that mechanical envelope to the folded arm: unfolding is permitted only
-in the same deep-night, ground-based tripod setup, where Earth occludes direct
-sunlight regardless of folded-optics orientation. No daytime unfolding is
-authorized by this tool. Recheck current
-Sun altitude before every motion and periodically while waiting. No bypass.
+The Sun threshold defines astronomical night for stellar calibration, not a
+30-degree angular avoidance envelope. In the confirmed ground-based tripod
+setup, Earth occludes direct sunlight regardless of heading or folded-optics
+orientation. Do not apply the open-mount mechanical envelope to the folded arm.
+No daytime or airborne operation is authorized. Recheck current Sun altitude
+before opening, every motion, and periodically while waiting. No bypass.
 If the device/model cannot support that envelope, reject rather than assume.
+
+2026-10-17 correction approved by the user: the previous -40-degree threshold
+unnecessarily applied an angular-separation margin to the Earth-occluded Sun.
+Astronomical dusk is -18 degrees (US Naval Observatory:
+https://aa.usno.navy.mil/faq/RST_defs). Clock/site, physical clearance, optics,
+level, authentication, ownership, no-replay, and finite-motion gates are unchanged.
 
 Open exactly once using `scope_move_to_horizon`; verify fresh native close=false
 and idle plus a new matching completion event. A timeout is unconfirmed and
