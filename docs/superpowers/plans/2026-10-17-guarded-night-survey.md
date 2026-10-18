@@ -18,7 +18,8 @@ commands are used; no device-native service or extra credential handling.
   (user-approved 2026-10-17 correction from -40); primary half-FOV <=3 degrees;
   level <=1 degree. Earth occlusion, not angular clearance, protects unfolding.
 - Native integer id/code=0/method validation; finite numbers exclude booleans.
-- Pulse speed <=4000 and duration <=2 seconds; displacement <=4 degrees.
+- Pulse speed <=240 native 15-arcsecond steps/second and duration <=2 seconds;
+  calibration 120 for 1 second, fine speed 60; displacement <=4 degrees.
 - Targets 20..65 degrees; 12 headings x 3 altitude rows; all gaps unknown.
 - No raw state/site/credentials/image bodies in logs; private files 0600/0700.
 - Wait <=4 hours, active run <=90 minutes; no uncertain motion retries.

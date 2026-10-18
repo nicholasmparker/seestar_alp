@@ -100,7 +100,8 @@ class Scope:
         elif method == "scope_speed_move":
             if self.fail_motion:
                 raise SurveyError("transport_uncertain")
-            speed = params["speed"] / 3600 * params["dur_sec"]
+            # Native units are 15-arcsecond steps/sec, not arcseconds/sec.
+            speed = params["speed"] * 15 / 3600 * params["dur_sec"]
             if params["angle"] == 90:
                 self.position[0] += speed
             elif params["angle"] == 270:
@@ -231,7 +232,9 @@ def test_preflight_and_missing_clearance_never_send_motion(tmp_path):
     assert scope.writes == []
 
 
-def test_astronomical_night_opens_once_then_refuses_pulse_at_dawn(tmp_path, monkeypatch):
+def test_astronomical_night_opens_once_then_refuses_pulse_at_dawn(
+    tmp_path, monkeypatch
+):
     # Catches the old -40 refusal and removal of the per-pulse dawn check.
     run, scope, _ = runner(tmp_path)
     monkeypatch.setattr(survey, "solar_altitude", lambda site, now: -24.36)
@@ -240,7 +243,7 @@ def test_astronomical_night_opens_once_then_refuses_pulse_at_dawn(tmp_path, monk
     assert scope.writes == [("scope_move_to_horizon", None)]
     monkeypatch.setattr(survey, "solar_altitude", lambda site, now: -18.0)
     with pytest.raises(SurveyError, match="waiting_for_safe_darkness"):
-        run.pulse({"speed": 1000, "angle": 90, "dur_sec": 1})
+        run.pulse({"speed": 120, "angle": 90, "dur_sec": 1})
     assert scope.writes == [("scope_move_to_horizon", None)]
 
 
@@ -301,9 +304,102 @@ def test_uncertain_pulse_never_repeats_and_expires_before_error(tmp_path):
     scope.state["mount"]["close"] = False
     scope.fail_motion = True
     with pytest.raises(SurveyError, match="transport_uncertain"):
-        run.pulse({"speed": 4000, "angle": 90, "dur_sec": 1})
+        run.pulse({"speed": 120, "angle": 90, "dur_sec": 1})
     assert sum(m == "scope_speed_move" for m, p in scope.writes) == 1
     assert clock.elapsed >= 1.5
+    assert run.manifest["motion_evidence"]["attempted"] == 1
+    assert run.manifest["motion_evidence"]["bounded_verified"] == 0
+
+
+def test_axis_probe_uses_half_degree_nominal_pulses_and_records_evidence(tmp_path):
+    run, scope, _ = runner(tmp_path)
+    run.preflight()
+    scope.state["mount"]["close"] = False
+    run.calibrate_axes()
+    pulses = [p for m, p in scope.writes if m == "scope_speed_move"]
+    assert pulses == [
+        {"speed": 120, "angle": 90, "dur_sec": 1},
+        {"speed": 120, "angle": 0, "dur_sec": 1},
+    ]
+    evidence = run.manifest["motion_evidence"]
+    assert evidence["attempted"] == evidence["bounded_verified"] == 2
+    assert evidence["first_verified_pulses"][0]["delta_alt_az"] == [0.5, 0.0]
+
+
+@pytest.mark.parametrize("speed", [241, 1000, 4000])
+def test_runner_refuses_excess_native_speed_before_hardware_write(tmp_path, speed):
+    run, scope, _ = runner(tmp_path)
+    run.preflight()
+    scope.state["mount"]["close"] = False
+    with pytest.raises(SurveyError, match="invalid_motion_pulse"):
+        run.pulse({"speed": speed, "angle": 90, "dur_sec": 1})
+    assert scope.writes == []
+
+
+def test_excess_actual_displacement_still_aborts_without_verified_evidence(tmp_path):
+    run, scope, _ = runner(tmp_path)
+    run.preflight()
+    scope.state["mount"]["close"] = False
+    original = scope.native
+
+    def native(method, params=None):
+        result = original(method, params)
+        if method == "scope_speed_move":
+            scope.position[0] += 5
+        return result
+
+    scope.native = native
+    with pytest.raises(SurveyError, match="pulse_exceeded_envelope"):
+        run.pulse({"speed": 120, "angle": 90, "dur_sec": 1})
+    evidence = run.manifest["motion_evidence"]
+    assert evidence["attempted"] == 1 and evidence["bounded_verified"] == 0
+    assert evidence["first_verified_pulses"] == []
+    assert len(scope.writes) == 1
+
+
+def test_motion_evidence_sample_remains_bounded(tmp_path):
+    run, scope, _ = runner(tmp_path)
+    run.preflight()
+    scope.state["mount"]["close"] = False
+    for _ in range(5):
+        run.pulse({"speed": 120, "angle": 90, "dur_sec": 1})
+    evidence = json.loads((tmp_path / "manifest.json").read_text())["motion_evidence"]
+    assert evidence["attempted"] == evidence["bounded_verified"] == 5
+    assert len(evidence["first_verified_pulses"]) == 3
+
+
+def test_accepted_pulse_still_moving_remains_unverified(tmp_path):
+    run, scope, _ = runner(tmp_path)
+    run.preflight()
+    scope.state["mount"]["close"] = False
+    original = scope.native
+
+    def native(method, params=None):
+        result = original(method, params)
+        if method == "scope_speed_move":
+            scope.state["mount"]["move_type"] = "manual"
+        return result
+
+    scope.native = native
+    with pytest.raises(SurveyError, match="mount_not_idle_altaz"):
+        run.pulse({"speed": 120, "angle": 90, "dur_sec": 1})
+    evidence = json.loads((tmp_path / "manifest.json").read_text())["motion_evidence"]
+    assert evidence["attempted"] == 1 and evidence["bounded_verified"] == 0
+    assert len(scope.writes) == 1
+
+
+def test_presend_evidence_save_failure_sends_no_motion(tmp_path, monkeypatch):
+    run, scope, _ = runner(tmp_path)
+    run.preflight()
+    scope.state["mount"]["close"] = False
+
+    def fail_save(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(survey, "private_write", fail_save)
+    with pytest.raises(OSError, match="disk full"):
+        run.pulse({"speed": 120, "angle": 90, "dur_sec": 1})
+    assert scope.writes == []
 
 
 def test_live_workflow_saves_private_partial_grid_without_claiming_clear_sky(tmp_path):

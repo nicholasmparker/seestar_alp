@@ -55,6 +55,12 @@ movement. Active survey has a 90-minute deadline.
    event plus fresh mount state. Unsupported `master_cli` is not attempted.
 2. Establish finite-pulse axis directions; each pulse expires in at most two
    seconds on the device. Verify fresh state and displacement after every pulse.
+   Native speed is measured in 15-arcsecond steps/second, not arcseconds/second:
+   calibration uses 120 for 1 second (nominal 0.5 degrees); survey speed never
+   exceeds 240 (nominal 1 degree/second). Retain the 4-degree measured-displacement
+   abort. Private
+   manifest motion evidence counts attempted versus bounded/idle-verified pulses
+   and retains the first three measured deltas; it is not stellar calibration.
 3. At two high-altitude headings, require fresh stellar solutions and consistent
    pointing offsets. Calibration failure stops the run; no guessed north,
    fabricated coordinates, or silent mount synchronization.

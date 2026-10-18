@@ -6,7 +6,7 @@ import ipaddress
 import threading
 import uuid
 
-from device.survey_safety import SurveyError, native_result
+from device.survey_safety import SURVEY_MAX_SPEED, SurveyError, native_result
 
 
 class SurveyReceipts:
@@ -89,7 +89,7 @@ def command(device, params):
         not isinstance(value, dict)
         or set(value) != {"speed", "angle", "dur_sec"}
         or type(value["speed"]) is not int
-        or not 1 <= value["speed"] <= 4000
+        or not 1 <= value["speed"] <= SURVEY_MAX_SPEED
         or type(value["dur_sec"]) is not int
         or not 1 <= value["dur_sec"] <= 2
         or type(value["angle"]) is not int

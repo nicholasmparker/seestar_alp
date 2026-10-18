@@ -4,6 +4,10 @@ import math
 
 SNAPSHOT_TIMEOUT_SECONDS = 45
 ASTRONOMICAL_NIGHT_SUN_ALTITUDE_DEG = -18
+# Native speed is 15-arcsecond steps/sec: 240 ~= 1 degree/sec, not 240 arcsec/sec.
+SURVEY_MAX_SPEED = 240
+SURVEY_CALIBRATION_SPEED = 120
+SURVEY_FINE_SPEED = 60
 
 
 class SurveyError(RuntimeError):
@@ -122,7 +126,7 @@ def pulse_for(current, target, axes):
     if error < 0:
         angle = (angle + 180) % 360
     return {
-        "speed": 4000 if abs(error) >= 1.5 else 1000,
+        "speed": SURVEY_MAX_SPEED if abs(error) >= 1.5 else SURVEY_FINE_SPEED,
         "angle": angle,
         "dur_sec": 2 if abs(error) > 3 else 1,
     }
