@@ -36,6 +36,34 @@ from astropy.coordinates import EarthLocation, AltAz
 import astropy.units as u
 
 
+def _rpc_log_value(data, method=None):
+    """Keep auth diagnostics without persisting challenges, signatures or keys.
+
+    This is a log-only projection: never change the wire data or cached reply.
+    """
+    parsed = data
+    if isinstance(data, str):
+        try:
+            parsed = json.loads(data)
+        except (ValueError, TypeError):
+            return "[unparseable RPC payload omitted]"
+    method = method or (parsed.get("method") if isinstance(parsed, dict) else None)
+    if method in (
+        "get_verify_str",
+        "verify_client",
+        "pi_is_verified",
+    ):
+        parsed = parsed if isinstance(parsed, dict) else {}
+        return {
+            "method": method,
+            "id": parsed.get("id") if type(parsed.get("id")) is int else None,
+            "code": parsed.get("code") if type(parsed.get("code")) is int else None,
+            "error_present": bool(parsed.get("error")),
+            "payload": "[redacted]",
+        }
+    return data
+
+
 class ThreePPA(TypedDict):
     eq_offset_alt: float
     eq_offset_az: float
@@ -346,7 +374,7 @@ class Seestar:
                 # debug: the busy-scope case repeats on every throttled retry;
                 # reconnect() already warns once per connection.
                 self.logger.debug(
-                    f"No auth challenge yet (scope busy?); will retry. response={resp}"
+                    f"No auth challenge yet (scope busy?); will retry. response={_rpc_log_value(resp, 'get_verify_str')}"
                 )
                 return False
 
@@ -355,35 +383,27 @@ class Seestar:
             verify_params = {"sign": signed, "data": challenge_str}
             verify_resp = self._auth_rpc_sync("verify_client", verify_params)
 
-            # Accept either result==0 or code==0 depending on firmware responses.
-            # Firmware 9.75+ (app 3.4.0) replies with result={"key_envelope":
-            # {...}} (the wrapped session key for its encrypted-RPC layer)
-            # instead of result==0; success is then signalled by code==0.
+            # New firmware returns code=0 with a result object (key_envelope).
+            # Prefer an explicit status code; only legacy replies without one
+            # use the scalar result. False is not a numeric success status.
             ok = False
-            has_envelope = False
-            if isinstance(verify_resp, dict):
-                result = verify_resp.get("result", verify_resp.get("code", -1))
-                if result == 0:
-                    ok = True
-                elif (
-                    isinstance(result, dict)
-                    and "key_envelope" in result
-                    and verify_resp.get("code", 0) == 0
-                ):
-                    ok = True
-                    has_envelope = True
+            if isinstance(verify_resp, dict) and not verify_resp.get("error"):
+                status = verify_resp.get("code", verify_resp.get("result"))
+                ok = type(status) is int and status == 0
 
             if not ok:
-                self.logger.warning(f"verify_client failed: {verify_resp}")
+                self.logger.warning(
+                    f"verify_client failed: {_rpc_log_value(verify_resp, 'verify_client')}"
+                )
                 return False
 
-            # The envelope is only ever returned for a client the device has
-            # just verified, and pi_is_verified on 9.75+ also reflects the
-            # unit's hardware/licence check rather than this client, so it can
-            # read false for a verified connection.  Don't second-guess it.
-            if has_envelope:
-                self.logger.info("Authentication successful")
-                return True
+            # k2-maintained divergence from upstream v3.3.0 (#781): upstream
+            # trusts a key_envelope reply and skips pi_is_verified, because on
+            # 9.75+ that call can reflect the unit's licence check rather than
+            # this client. This fork keeps the check fail-closed: the owner's
+            # S30 Pro on 9.75 reports pi_is_verified=true after a good
+            # handshake, and an unconfirmed session must not look verified.
+            # Revisit if a unit reads false after a genuine verify.
 
             # sanity check
             try:
@@ -395,12 +415,12 @@ class Seestar:
                 if isinstance(result_val, bool):
                     is_verified = result_val
                 elif isinstance(result_val, dict):
-                    is_verified = result_val.get("is_verified", False)
+                    is_verified = result_val.get("is_verified") is True
                 else:
                     is_verified = False
                 if not is_verified:
                     self.logger.warning(
-                        f"Device did not report verified after verify_client: {verified}"
+                        f"Device did not report verified after verify_client: {_rpc_log_value(verified, 'pi_is_verified')}"
                     )
                     return False
             except Exception:
@@ -410,7 +430,7 @@ class Seestar:
             self.logger.info("Authentication successful")
             return True
         except Exception as e:
-            self.logger.warning(f"Authentication error: {e}")
+            self.logger.warning(f"Authentication error: {type(e).__name__}")
             return False
 
     # Minimum seconds between auth attempts. A busy scope keeps timing out
@@ -493,7 +513,7 @@ class Seestar:
                 time.sleep(3)
                 return False
             # todo : don't send if not connected or socket is null?
-            self.logger.debug(f"sending: {data}")
+            self.logger.debug(f"sending: {_rpc_log_value(data)}")
             self.s.sendall(
                 data.encode()
             )  # TODO: would utf-8 or unicode_escaped help here
@@ -508,7 +528,9 @@ class Seestar:
                 return self.send_message(data)
             return False
         except Exception:
-            self.logger.error("General error trying to send message: ", data)
+            self.logger.error(
+                f"General error trying to send message: {_rpc_log_value(data)}"
+            )
             return False
 
     def socket_force_close(self) -> None:
@@ -715,10 +737,10 @@ class Seestar:
                     if "jsonrpc" in parsed_data:
                         # {"jsonrpc":"2.0","Timestamp":"9507.244805160","method":"scope_get_equ_coord","result":{"ra":17.093056,"dec":34.349722},"code":0,"id":83}
                         if parsed_data["method"] == "scope_get_equ_coord":
-                            self.logger.debug(f"{parsed_data}")
+                            self.logger.debug(f"{_rpc_log_value(parsed_data)}")
                             self.update_equ_coord(parsed_data)
                         else:
-                            self.logger.debug(f"{parsed_data}")
+                            self.logger.debug(f"{_rpc_log_value(parsed_data)}")
                         if parsed_data["method"] == "get_view_state":
                             self.update_view_state(parsed_data)
                         # keep a running queue of last 100 responses for sync call results
@@ -881,18 +903,20 @@ class Seestar:
                 last_slow = now
                 if elapsed > 10:
                     self.logger.error(
-                        f"Failed to wait for message response.  {elapsed} seconds. {cur_cmdid=} {data=}"
+                        f"Failed to wait for message response.  {elapsed} seconds. {cur_cmdid=} data={_rpc_log_value(data)}"
                     )
                     data["result"] = "Error: Exceeded allotted wait time for result"
                     self._note_sync_timeout()
                     return data
                 else:
                     self.logger.warning(
-                        f"SLOW message response.  {elapsed} seconds. {cur_cmdid=} {data=}"
+                        f"SLOW message response.  {elapsed} seconds. {cur_cmdid=} data={_rpc_log_value(data)}"
                     )
                     # todo : dump out stats.  last run time on threads, connection status, etc.
             time.sleep(0.5)
-        self.logger.debug(f"response is {self.response_dict[cur_cmdid]}")
+        self.logger.debug(
+            f"response is {_rpc_log_value(self.response_dict[cur_cmdid])}"
+        )
         self._note_sync_reply()
         return self.response_dict[cur_cmdid]
 
