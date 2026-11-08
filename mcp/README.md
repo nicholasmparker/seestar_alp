@@ -66,6 +66,17 @@ seestar-mcp          # stdio MCP server
 python -m seestar_mcp
 ```
 
+To reach the server from an agent on another host, run it over streamable
+HTTP on loopback and forward the port with SSH:
+
+```bash
+seestar-mcp --transport streamable-http --port 8769   # serves http://127.0.0.1:8769/mcp
+```
+
+The HTTP transport has no authentication, so `--host` accepts only loopback
+addresses (`127.0.0.1`, `::1`, `localhost`); requests whose `Host` header is
+not loopback are rejected (DNS-rebinding protection).
+
 ### Register with an MCP client
 
 Point your client at the command. Example client config entry:
