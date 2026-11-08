@@ -3019,6 +3019,59 @@ def test_authenticate_succeeds_without_receive_thread(monkeypatch, seestar):
     assert methods == ["get_verify_str", "verify_client", "pi_is_verified"]
 
 
+def test_authenticate_accepts_key_envelope_verify_reply(monkeypatch, seestar):
+    """Firmware 9.75+ answers verify_client with result={"key_envelope": ...}
+    rather than result==0; that is a success, not a rejection.
+
+    k2-maintained: upstream skips pi_is_verified after an envelope. This fork
+    still requires it (see test_authenticate_envelope_requires_verified_device
+    for the fail-closed case), so the reply here confirms verification."""
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "SIGNATURE")
+
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "CHALLENGE"}, "code": 0},
+            {
+                "method": "verify_client",
+                "result": {
+                    "key_envelope": {
+                        "version": "1",
+                        "wrap": "RSA-OAEP-SHA256",
+                        "kdf": "HKDF-SHA256",
+                        "cipher": "AES-128-GCM",
+                        "data": "QUJD",
+                    }
+                },
+                "code": 0,
+            },
+            {"method": "pi_is_verified", "result": True, "code": 0},
+        ]
+    )
+
+    assert seestar.authenticate() is True
+    methods = [json.loads(p.decode())["method"] for p in seestar.s.sent]
+    assert methods == ["get_verify_str", "verify_client", "pi_is_verified"]
+
+
+def test_authenticate_rejects_verify_error_even_with_dict_result(monkeypatch, seestar):
+    """A non-zero code is still a failure; only a key_envelope with code 0 counts."""
+    monkeypatch.setattr(seestar, "_sign_challenge", lambda _c: "SIGNATURE")
+
+    seestar.s = _AuthFakeSocket(
+        replies=[
+            {"method": "get_verify_str", "result": {"str": "CHALLENGE"}, "code": 0},
+            {
+                "method": "verify_client",
+                "result": {"key_envelope": {}},
+                "code": 207,
+                "error": "fail",
+            },
+        ]
+    )
+
+    assert seestar.authenticate() is False
+
+
 def test_authenticate_preserves_events_streamed_during_handshake(monkeypatch, seestar):
     """Events pushed by the device during the handshake must be handed to the
     receive thread (via _auth_leftover), not silently dropped."""

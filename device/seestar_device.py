@@ -401,6 +401,14 @@ class Seestar:
                 )
                 return False
 
+            # k2-maintained divergence from upstream v3.3.0 (#781): upstream
+            # trusts a key_envelope reply and skips pi_is_verified, because on
+            # 9.75+ that call can reflect the unit's licence check rather than
+            # this client. This fork keeps the check fail-closed: the owner's
+            # S30 Pro on 9.75 reports pi_is_verified=true after a good
+            # handshake, and an unconfirmed session must not look verified.
+            # Revisit if a unit reads false after a genuine verify.
+
             # sanity check
             try:
                 verified = self._auth_rpc_sync("pi_is_verified")
