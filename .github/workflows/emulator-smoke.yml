@@ -72,6 +72,9 @@ jobs:
           pip install -e '.[system]'
           playwright install --with-deps chromium
 
+      - name: Install cli and mcp packages (for the ViewPlan system test)
+        run: pip install -e ./cli -e ./mcp
+
       - name: Read smoke firmware version
         id: fw
         run: |

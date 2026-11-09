@@ -81,14 +81,22 @@ def pytest_addoption(parser):
     )
 
 
+# Modules whose imports need the system-test extras: test_flow.py needs
+# playwright (via ui_classic), test_view_plan.py needs ./cli and ./mcp.
+_NEEDS_SYSTEM_EXTRAS = frozenset({"test_flow.py", "test_view_plan.py"})
+
+
 def pytest_ignore_collect(collection_path: Path, config):
-    """test_flow.py imports playwright at module level (via ui_classic),
-    so pytest must import it to collect items even though
-    pytest_collection_modifyitems would skip those items anyway. Without
-    --target, skip collecting it outright so environments without
-    playwright installed (e.g. CI) don't hit an ImportError.
+    """These modules import their extras at module level, so pytest must import
+    them to collect items even though pytest_collection_modifyitems would skip
+    those items anyway. Without --target, skip collecting them outright so
+    environments without the extras installed (e.g. the unit CI lane) don't hit
+    an ImportError. With --target, a missing extra fails loudly.
     """
-    if collection_path.name == "test_flow.py" and config.getoption("--target") is None:
+    if (
+        collection_path.name in _NEEDS_SYSTEM_EXTRAS
+        and config.getoption("--target") is None
+    ):
         return True
 
 

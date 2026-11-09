@@ -107,6 +107,7 @@ connection/API error.
 | **Imaging** | `start_stack`, `stop_view`, `set_gain`, `set_exposure`, `get_last_image`, `create_dark` |
 | **Settings** | `read_settings`, `write_setting` |
 | **Scheduling** | `get_schedule`, `create_schedule`, `add_schedule_item`, `schedule_mosaic`, `start_mosaic`, `start_scheduler`, `stop_scheduler`, `export_schedule`, `import_schedule` |
+| **Night plans (on the scope)** | `plan_night`, `get_plan_status`, `cancel_plan` |
 | **Startup / system** | `startup_sequence`, `set_heater` |
 | **System (physical, gated)** | `scope_park`, `scope_move_to_horizon`, `reboot`, `shutdown` |
 
@@ -121,6 +122,69 @@ connection/API error.
   pass an explicit `variant` to force one. An inline device rejection is
   returned as `{"ok": false, ...}` rather than reported as success.
 
+### Night plans (on the scope)
+
+`plan_night` sends a whole multi-target night to the scope as a firmware
+**ViewPlan**, the same mechanism as the ZWO app's *Plan*. The scope runs it on
+its own, so this server, seestar_alp and the network can all go away once it is
+accepted. ALP's scheduler (`start_scheduler`) is different: it runs inside
+seestar_alp, which has to stay up all night, and its `wait_until` times use the
+ALP host's clock.
+
+```python
+plan_night(
+    targets=[
+        {"name": "IC 1396A", "ra": "21:36:33", "dec": "+57:30:00",
+         "start": "18:25", "end": "01:00", "lp_filter": True},
+        {"name": "IC 434", "ra": "05:41:00", "dec": "-02:27:30",
+         "start": "01:00", "end": "05:05", "lp_filter": False},
+    ],
+    timezone="America/Denver",   # the zone the HH:MM times are in
+    night_of="2026-11-08",       # the evening's date; a night runs noon to noon
+    exposure_s=20, af_on_switch=True, close_arm=True, confirm=True,
+)
+```
+
+- **Targets** take J2000 `ra` (hours or `HH:MM:SS`) and `dec` (degrees or
+  `+DD:MM:SS`), local `start`/`end` as `HH:MM`, and `lp_filter`. Every time
+  belongs to the night of `night_of`, which runs from noon to noon, so `01:00`
+  is the next morning. Targets must be in time order without overlaps, and the
+  plan must end within 24 hours. A target already under way starts now; one that
+  is over or has under 5 minutes left is refused, never moved to another night.
+- **Time zone.** Pass `timezone` for the times you wrote. Without it the tool
+  uses the scope's own zone, but refuses when that zone is UTC: seestar_alp's
+  startup routine sets the scope's zone from its host, which is often UTC.
+- **Timing.** The firmware counts a target's start in minutes after the scope's
+  local midnight and turns that into a countdown when the plan starts. The tool
+  reads the scope's clock (`pi_get_time`) and computes those minutes from it, so
+  the plan runs at the times you wrote even if the scope's zone is wrong (for
+  example UTC) or its clock is a few minutes off. It refuses a plan the firmware
+  would silently move to another day, a first target that ends within 90 s,
+  the two minutes before the scope's midnight, and a scope clock that disagrees
+  with its own zone name.
+- **Exposure and gain are global.** A plan target has no exposure or gain: every
+  target stacks at the scope's exposure setting and its own gain. Per-target
+  exposure or gain is refused; `exposure_s` sets the stack exposure once, before
+  the plan.
+- **Autofocus and closing the arm** are the scope's persistent `plan_target_af`
+  and `viewplan_gohome` settings. The tool writes and reads back both before it
+  sends the plan (the same-named members of the plan request are ignored by the
+  firmware). Autofocus at each switch is likely but not guaranteed.
+- **Filter.** Each target's goto puts the wheel on IR-cut, then a target with
+  `lp_filter: true` moves it to LP.
+- **Confirmation.** Without `confirm=true`, `plan_night` only previews the
+  normalised schedule, including the night it resolved, and changes nothing.
+  `confirm=true` requires `night_of`, so a late confirmation cannot arm a
+  different night from the one approved. The reply means *accepted, not done*,
+  and includes a read-back of the plan the scope holds. If the scope does not
+  answer in time, the tool reads the plan back before reporting either way.
+- **Status.** `get_plan_status` reports the plan and each target's state and
+  code. `complete` means the plan's loop finished, not that every target
+  succeeded: a target whose end passed before it could run shows code 513.
+- **Cancel.** `cancel_plan` sends `clear_view_plan`. On firmware 9.75 that also
+  deletes the stored plan, so send it again to rerun it. While a plan runs, the
+  scope refuses to start another view or plan.
+
 ### Safety
 
 There is no raw command passthrough — only curated tools. Physical and
@@ -128,7 +192,8 @@ destructive actions require explicit confirmation: `scope_park`,
 `scope_move_to_horizon`, `reboot`, and `shutdown` each refuse unless called with
 `confirm=true`, and making no device call when refused. Because the scheduler
 can execute physical actions too, `add_schedule_item` (for a physical action)
-and `start_scheduler` likewise require `confirm=true`.
+and `start_scheduler` likewise require `confirm=true`, as does `plan_night`,
+which arms an unattended night on the scope.
 
 ## Development
 

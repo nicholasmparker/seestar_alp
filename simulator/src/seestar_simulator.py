@@ -4,6 +4,9 @@ import collections
 import uuid
 import json
 import socketserver
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from config import Config
 
 
@@ -49,6 +52,9 @@ class SeestarSimulator:
             "item_number": 9999,
         }
         self.event_state = {}
+        self.view_plan = (
+            None  # the held ViewPlan node, as iscope_get_app_state shows it
+        )
         self.response_dict = {}
         self.image_mode = "none"
         self.pa_enhance_mode = False
@@ -332,7 +338,14 @@ class SeestarSimulator:
             }
         elif method == "set_setting":
             params = data.get("params", {})
-            self.state["setting"].update(params)
+            # Nested objects (exp_ms, stack, ...) update only the members sent,
+            # like the firmware.
+            for key, value in params.items():
+                held = self.state["setting"].get(key)
+                if isinstance(value, dict) and isinstance(held, dict):
+                    held.update(value)
+                else:
+                    self.state["setting"][key] = value
             if "alpaca_enable" in params:
                 if params["alpaca_enable"]:
                     self._start_alpaca_server()
@@ -725,6 +738,40 @@ class SeestarSimulator:
                 "id": cur_cmdid,
             }
 
+        elif method == "pi_get_time":
+            return {
+                "jsonrpc": "2.0",
+                "Timestamp": timestamp,
+                "method": "pi_get_time",
+                "result": self._local_time(),
+                "code": 0,
+                "id": cur_cmdid,
+            }
+        elif method == "iscope_get_app_state":
+            plan_running = (self.view_plan or {}).get("state") == "working"
+            result = {"View": {"state": "working" if plan_running else "idle"}}
+            if self.view_plan is not None:
+                result["ViewPlan"] = self.view_plan
+            return {
+                "jsonrpc": "2.0",
+                "Timestamp": timestamp,
+                "method": "iscope_get_app_state",
+                "result": result,
+                "code": 0,
+                "id": cur_cmdid,
+            }
+        elif method == "set_view_plan":
+            code = self._start_view_plan(data.get("params"))
+            return self._plan_reply("set_view_plan", code, timestamp, cur_cmdid)
+        elif method == "clear_view_plan":
+            if self.view_plan is not None and self.view_plan["state"] == "working":
+                self.view_plan["state"] = "cancel"
+                for target in self.view_plan["plan"]["list"]:
+                    if target["state"] in ("idle", "working"):
+                        target.update(state="fail", code=253, error="fail to operate")
+                self._send_event({"Event": "ViewPlan", **self.view_plan})
+            return self._plan_reply("clear_view_plan", 0, timestamp, cur_cmdid)
+
         # Add more simulated methods as needed
         else:
             self.logger.info(
@@ -737,6 +784,82 @@ class SeestarSimulator:
                 "result": 0,
                 "id": cur_cmdid,
             }
+
+    def _local_time(self):
+        """pi_get_time: wall clock in the zone pi_set_time last set (UTC by default)."""
+        zone_name = self.scope_time.get("time_zone") or "Etc/UTC"
+        try:
+            zone = ZoneInfo(zone_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            zone_name, zone = "Etc/UTC", timezone.utc
+        now = datetime.now(zone)
+        return {
+            "year": now.year,
+            "mon": now.month,
+            "day": now.day,
+            "hour": now.hour,
+            "min": now.minute,
+            "sec": now.second,
+            "time_zone": zone_name,
+        }
+
+    def _start_view_plan(self, params):
+        """set_view_plan: hold the plan and report it working (no capture is simulated).
+
+        Returns the reply code: 536 if a plan is running, 207 for a malformed plan.
+        """
+        if self.view_plan is not None and self.view_plan["state"] == "working":
+            return 536
+        if not isinstance(params, dict) or "plan_name" not in params:
+            if self.view_plan is None:  # restart form with nothing held
+                return 207
+            plan = self.view_plan["plan"]
+        else:
+            targets = params.get("list")
+            required = ("start_min", "duration_min", "target_id")
+            if (
+                not isinstance(targets, list)
+                or not targets
+                or not all(
+                    isinstance(t, dict)
+                    and all(type(t.get(k)) is int for k in required)
+                    and t.get("camera_mode") == "tele"
+                    for t in targets
+                )
+            ):
+                return 207
+            plan = {
+                "plan_name": params["plan_name"],
+                "list": [dict(t) for t in targets],
+            }
+        setting = self.state["setting"]
+        plan["plan_target_af"] = bool(setting.get("plan_target_af", False))
+        plan["viewplan_gohome"] = bool(setting.get("viewplan_gohome", True))
+        for target in plan["list"]:
+            for key in ("code", "error"):
+                target.pop(key, None)
+            target.update(state="idle", lapse_ms=0)
+        self.view_plan = {"state": "working", "lapse_ms": 0, "plan": plan}
+        self._send_event({"Event": "ViewPlan", **self.view_plan})
+        return 0
+
+    def _plan_reply(self, method, code, timestamp, cur_cmdid):
+        reply = {"jsonrpc": "2.0", "Timestamp": timestamp, "method": method}
+        if code:
+            labels = {536: "view plan is already running", 207: "fail to operate"}
+            reply.update(error=labels.get(code, "fail to operate"), code=code)
+        else:
+            reply.update(result=0, code=0)
+        reply["id"] = cur_cmdid
+        return reply
+
+    def _send_event(self, event):
+        if self.socket is None:
+            return
+        event = {"Timestamp": f"{time.time() - self.start_time:2.9f}", **event}
+        self.send_unsolicited_message(
+            self.socket, (self.host, self.port), json.dumps(event) + "\r\n"
+        )
 
     def start_stack(self):
         self.stack_response_thread = threading.Thread(target=self._stack_response)
