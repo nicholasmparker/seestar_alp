@@ -12,6 +12,7 @@ _MODULES = (
     "system",
     "focus",
     "filter_wheel",
+    "view_plan",
 )
 
 
