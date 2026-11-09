@@ -24,7 +24,7 @@ Firmware behaviour relied on here is from seestar-spec
 
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime
 from typing import Any
 
 from pydantic import ValidationError
@@ -143,7 +143,9 @@ def _refuse(error: str, **extra: Any) -> dict[str, Any]:
     return {"ok": False, "error": error, **extra}
 
 
-async def _write_setting(telescope_id: int, name: str, value: Any) -> str | None:
+async def _write_setting(
+    telescope_id: int, name: str, value: Any, shown: Any = None
+) -> str | None:
     """Write a setting, trying each known variant until get_setting reads it back."""
     tried: list[str] = []
     for path in SETTING_PATHS[name]:
@@ -152,7 +154,8 @@ async def _write_setting(telescope_id: int, name: str, value: Any) -> str | None
         if readback.error is None and _dig(readback.result, path) == value:
             return None
         tried.append(".".join(path) + (f" ({written.error})" if written.error else ""))
-    return f"the scope did not keep {name}={value!r} (tried {', '.join(tried)})"
+    shown = value if shown is None else shown
+    return f"the scope did not keep {name}={shown!r} (tried {', '.join(tried)})"
 
 
 def _busy(app_state: Any) -> str | None:
@@ -172,6 +175,20 @@ def _busy(app_state: Any) -> str | None:
     return None
 
 
+def _alp_scheduler_busy(schedule: Any) -> str | None:
+    """ALP's own scheduler would start views the running plan refuses (536)."""
+    if not isinstance(schedule, dict) or schedule.get("ok") is False:
+        error = schedule.get("error") if isinstance(schedule, dict) else schedule
+        return f"could not read ALP's scheduler: {error!r}"
+    state = schedule.get("state")
+    if state in ("working", "stopping"):
+        return (
+            f"ALP's scheduler is {state} and would fight the plan; stop it with "
+            "stop_scheduler first"
+        )
+    return None
+
+
 def _summary(
     schedule: Schedule,
     plan_name: str,
@@ -182,6 +199,7 @@ def _summary(
     clock = schedule.clock
     return {
         "plan_name": plan_name,
+        "night_of": schedule.night_of.isoformat(),
         "timezone": schedule.timezone,
         "scope_clock": {"local": clock.wall.isoformat(), "time_zone": clock.time_zone},
         "settings": {
@@ -250,6 +268,7 @@ async def plan_night_tool(
     close_arm: bool = True,
     exposure_s: int | None = None,
     timezone: str | None = None,
+    night_of: str | None = None,
     plan_name: str | None = None,
     confirm: bool = False,
     telescope_id: int = 1,
@@ -258,15 +277,18 @@ async def plan_night_tool(
 
     Each target: name, J2000 ra (hours or 'HH:MM:SS') and dec (degrees or
     '+DD:MM:SS'), start and end as 'HH:MM' in `timezone` (an IANA name such as
-    'America/Denver'; default: the scope's own zone), and lp_filter. Targets run
-    in list order, must not overlap, and the plan must end within 24 hours; a
-    target already under way starts now. Exposure and gain are global, not per
-    target: exposure_s (1-600) sets the stack exposure for the whole plan, and
-    gain follows the scope's own setting. af_on_switch autofocuses at each target
-    and close_arm parks at the end; both are persistent scope settings.
+    'America/Denver'), and lp_filter. All times belong to the night of `night_of`
+    ('YYYY-MM-DD', the evening's date; a night runs noon to noon). Targets must be
+    in time order without overlaps, and the plan must end within 24 hours. A
+    target already under way starts now; one that is over is refused, never moved
+    to another night. Exposure and gain are global, not per target: exposure_s
+    (1-600) sets the stack exposure for the whole plan, and gain follows the
+    scope's own setting. af_on_switch autofocuses at each target and close_arm
+    parks at the end; both are persistent scope settings.
 
-    Without confirm=true nothing is changed and the reply previews the schedule.
-    With confirm=true the reply means accepted, not done: check get_plan_status.
+    Without confirm=true nothing is changed and the reply previews the schedule,
+    including the night it resolved. confirm=true requires night_of, and the reply
+    means accepted, not done: check get_plan_status.
     """
     if telescope_id == 0:
         return _refuse(
@@ -283,6 +305,14 @@ async def plan_night_tool(
         ]
     except ValidationError as exc:
         return _refuse(f"plan not sent: {exc}")
+    if not parsed:
+        return _refuse("plan not sent: a plan needs at least one target")
+    night: date | None = None
+    if night_of is not None:
+        try:
+            night = date.fromisoformat(night_of)
+        except ValueError:
+            return _refuse(f"night_of {night_of!r} is not a date like 2026-11-08")
 
     clock_reply = await _sync(telescope_id, "pi_get_time")
     if clock_reply.error is not None:
@@ -291,19 +321,27 @@ async def plan_night_tool(
         )
     try:
         clock = ScopeClock.from_pi_get_time(clock_reply.result, _utcnow())
-        schedule = build_schedule(parsed, clock, timezone)
+        schedule = build_schedule(parsed, clock, timezone, night)
     except PlanError as exc:
         return _refuse(f"plan not sent: {exc}", errors=exc.errors)
 
-    # Name the night by the evening it belongs to, even if it starts after midnight.
-    evening = schedule.targets[0].start - timedelta(hours=12)
-    name = plan_name or f"Night of {evening:%Y-%m-%d}"
+    name = plan_name or f"Night of {schedule.night_of}"
     summary = _summary(schedule, name, af_on_switch, close_arm, exposure_s)
     if not confirm:
         return _refuse(
             "plan_night arms an unattended night; review this schedule, then pass "
-            "confirm=true after the user confirms. Nothing was changed.",
+            f"confirm=true with night_of='{schedule.night_of}' after the user "
+            "confirms. Nothing was changed.",
             requires_confirmation=True,
+            **summary,
+        )
+    if night is None:
+        # Binds what is armed to the night that was approved, so a late
+        # confirmation cannot quietly arm a different night.
+        return _refuse(
+            f"plan not sent: confirm=true needs night_of; this schedule is for the "
+            f"night of {schedule.night_of}, so pass night_of='{schedule.night_of}' "
+            "if that is the night the user approved.",
             **summary,
         )
 
@@ -313,23 +351,45 @@ async def plan_night_tool(
             f"plan not sent: could not read the scope's state: {app_state.error}",
             **summary,
         )
-    busy = _busy(app_state.result)
+    busy = _busy(app_state.result) or _alp_scheduler_busy(
+        await call(telescope_id, lambda c: c.get_schedule())
+    )
     if busy:
         return _refuse(f"plan not sent: {busy}", **summary)
 
-    writes: list[tuple[str, Any]] = []
+    writes: list[tuple[str, Any, Any]] = []
     if exposure_s is not None:
-        writes.append(("exposure_s", exposure_s * 1000))
-    writes += [("plan_target_af", af_on_switch), ("viewplan_gohome", close_arm)]
+        writes.append(("exposure_s", exposure_s * 1000, exposure_s))
+    writes += [
+        ("plan_target_af", af_on_switch, None),
+        ("viewplan_gohome", close_arm, None),
+    ]
     changed: list[str] = []
-    for setting, value in writes:
-        error = await _write_setting(telescope_id, setting, value)
+    for setting, value, shown in writes:
+        error = await _write_setting(telescope_id, setting, value, shown)
         if error:
             return _refuse(f"plan not sent: {error}", changed=changed, **summary)
         changed.append(setting)
 
     params = view_plan_params(schedule, name, af_on_switch, close_arm)
     sent = await _sync(telescope_id, "set_view_plan", params)
+    if sent.error is not None and sent.code is None:
+        # No answer: the request may still have reached the scope, so look.
+        confirmed, plan_state, warnings = await _confirm(telescope_id, params)
+        if confirmed:
+            summary["warnings"] += [
+                f"set_view_plan got no reply ({sent.error}), but the scope holds "
+                "and runs the plan"
+            ]
+            return _accepted(confirmed, plan_state, changed, summary)
+        return _refuse(
+            f"set_view_plan got no reply ({sent.error}) and the plan could not be "
+            "confirmed on the scope",
+            hint="It may still have arrived: check get_plan_status before retrying.",
+            uncertain=True,
+            changed=changed,
+            **summary,
+        )
     if sent.error is not None:
         hint = REJECTION_HINTS.get(sent.code or 0)
         if hint is None:
@@ -343,6 +403,15 @@ async def plan_night_tool(
 
     confirmed, plan_state, warnings = await _confirm(telescope_id, params)
     summary["warnings"] += warnings
+    return _accepted(confirmed, plan_state, changed, summary)
+
+
+def _accepted(
+    confirmed: bool,
+    plan_state: str | None,
+    changed: list[str],
+    summary: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "ok": True,
         "status": "accepted, not done",
@@ -400,7 +469,9 @@ def _plan_status(
         "counts": dict(Counter(t["state"] for t in targets)),
         "all_targets_complete": bool(targets)
         and all(t["state"] == "complete" for t in targets),
-        "note": STATE_NOTES.get(state, ""),
+        "note": STATE_NOTES.get(state, "")
+        if targets
+        else "The scope holds no plan targets.",
         "warnings": warnings,
     }
     if node.get("code") is not None:
@@ -456,16 +527,24 @@ async def cancel_plan_tool(telescope_id: int = 1) -> dict[str, Any]:
             "cancel_plan addresses one scope; telescope_id 0 is not supported"
         )
     cleared = await _sync(telescope_id, "clear_view_plan")
-    if cleared.error is not None:
-        return _refuse(
-            f"clear_view_plan failed: {cleared.error}",
-            hint="Stopping a target mid-capture can take a while; check "
-            "get_plan_status before retrying.",
-        )
+    status = None
+    if cleared.error is not None and cleared.code is None:
+        # No answer: stopping a target mid-capture can outlast ALP's wait.
+        status = await get_plan_status_tool(telescope_id)
+        if status.get("ok") is not True or status.get("state") == "working":
+            return _refuse(
+                f"clear_view_plan got no reply ({cleared.error}) and the plan may "
+                "still be running",
+                hint="Check get_plan_status in a minute before retrying.",
+                uncertain=True,
+                status=status,
+            )
+    elif cleared.error is not None:
+        return _refuse(f"clear_view_plan failed: {cleared.error}")
     return {
         "ok": True,
         "result": "cancel requested",
-        "status": await get_plan_status_tool(telescope_id),
+        "status": status or await get_plan_status_tool(telescope_id),
         "note": "On firmware 9.75 the stored plan is deleted too: send it again "
         "with plan_night. The arm may stay open; use scope_park if needed.",
     }

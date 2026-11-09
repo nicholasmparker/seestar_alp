@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -194,6 +194,7 @@ def test_build_schedule_for_tonight():
     assert not a.starts_now and not b.starts_now
     assert [t.target_id for t in s.targets] == [1, 2]
     assert s.timezone == "America/Denver"
+    assert s.night_of == date(2026, 11, 8)
     assert s.warnings == []
 
 
@@ -274,22 +275,89 @@ def test_build_schedule_allows_gap():
     )
 
 
-def test_build_schedule_refuses_plan_ending_beyond_24h():
-    # At 02:00 the first target is over, so the plan resolves to the next night.
+def test_build_schedule_refuses_target_already_over_instead_of_moving_it():
+    # At 02:00 the first target ended at 01:00. It is refused, never moved to
+    # tomorrow night, and the message says which night was assumed.
+    clock = _clock("2026-11-09T02:00:00", "America/Denver", "2026-11-09T09:00:00")
+    with pytest.raises(PlanError, match="already over.*2026-11-08.*night_of"):
+        build_schedule(_targets(TRUNK, HORSEHEAD), clock, None)
+    rest = build_schedule(_targets(HORSEHEAD), clock, None).targets[0]
+    assert rest.starts_now and rest.end.isoformat() == "2026-11-09T05:05:00-07:00"
+
+
+def test_build_schedule_refuses_window_ended_a_minute_ago():
+    clock = _clock("2026-11-08T23:01:00", "America/Denver", "2026-11-09T06:01:00")
+    t = _targets({**TRUNK, "start": "21:00", "end": "23:00"})
+    with pytest.raises(PlanError, match="already over"):
+        build_schedule(t, clock, None)
+
+
+def test_build_schedule_refuses_night_more_than_24h_ahead():
     clock = _clock("2026-11-09T02:00:00", "America/Denver", "2026-11-09T09:00:00")
     with pytest.raises(PlanError, match="24 hours"):
-        build_schedule(_targets(TRUNK, HORSEHEAD), clock, None)
+        build_schedule(_targets(TRUNK, HORSEHEAD), clock, None, date(2026, 11, 9))
 
 
-def test_build_schedule_refuses_reversed_targets():
-    with pytest.raises(PlanError, match="24 hours"):
-        build_schedule(_targets(HORSEHEAD, TRUNK), DENVER_5PM, None)
+def test_build_schedule_plans_tonight_in_the_morning_with_night_of():
+    clock = _clock("2026-11-09T06:00:00", "America/Denver", "2026-11-09T13:00:00")
+    with pytest.raises(PlanError, match="already over"):
+        build_schedule(_targets(TRUNK, HORSEHEAD), clock, None)  # assumes last night
+    s = build_schedule(_targets(TRUNK, HORSEHEAD), clock, None, date(2026, 11, 9))
+    assert s.night_of == date(2026, 11, 9)
+    assert s.targets[0].start.isoformat() == "2026-11-09T18:25:00-07:00"
+    assert s.targets[1].end.isoformat() == "2026-11-10T05:05:00-07:00"
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        (TRUNK, HORSEHEAD),  # listed backwards below
+        (
+            {**TRUNK, "start": "18:00", "end": "19:00"},
+            {**HORSEHEAD, "start": "17:00", "end": "17:30"},
+        ),
+        (
+            {**TRUNK, "start": "23:00", "end": "23:30"},
+            {**HORSEHEAD, "start": "22:00", "end": "22:30"},
+        ),
+    ],
+    ids=["reversed", "earlier-evening", "earlier-hour"],
+)
+def test_build_schedule_refuses_targets_out_of_order(first, second):
+    targets = _targets(second, first) if first is TRUNK else _targets(first, second)
+    with pytest.raises(PlanError, match="time order"):
+        build_schedule(targets, DENVER_5PM, None)
 
 
 def test_build_schedule_refuses_end_too_close():
     clock = _clock("2026-11-09T00:59:30", "America/Denver", "2026-11-09T07:59:30")
-    with pytest.raises(PlanError, match="ends"):
+    with pytest.raises(PlanError, match="left"):
         build_schedule(_targets(TRUNK, HORSEHEAD), clock, None)
+
+
+def test_build_schedule_refuses_target_with_under_five_minutes_left():
+    clock = _clock("2026-11-08T22:58:00", "America/Denver", "2026-11-09T05:58:00")
+    t = _targets({**TRUNK, "start": "21:00", "end": "23:00"})
+    with pytest.raises(PlanError, match="only 2 minutes left"):
+        build_schedule(t, clock, None)
+
+
+def test_build_schedule_refuses_rounding_past_24h_with_the_24h_message():
+    # Scope clock 40 s fast: the last end rounds to just over a day of the
+    # scope's clock, which the firmware would read as last night's plan.
+    clock = _clock("2026-11-08T06:00:50", "America/Denver", "2026-11-08T13:00:10")
+    t = _targets({**TRUNK, "start": "05:50", "end": "06:00"})
+    with pytest.raises(PlanError, match="24 hours"):
+        build_schedule(t, clock, None, date(2026, 11, 8))
+
+
+def test_build_schedule_warns_on_time_that_happens_twice():
+    # US DST ends 2026-11-01 02:00: 01:30 happens in MDT and again in MST.
+    clock = _clock("2026-10-31T20:00:00", "America/Denver", "2026-11-01T02:00:00")
+    t = _targets({**TRUNK, "start": "22:00", "end": "01:30"})
+    s = build_schedule(t, clock, None)
+    assert s.targets[0].end.isoformat() == "2026-11-01T01:30:00-06:00"
+    assert any("twice" in w for w in s.warnings)
 
 
 def test_build_schedule_refuses_near_scope_midnight():
@@ -299,11 +367,17 @@ def test_build_schedule_refuses_near_scope_midnight():
 
 
 @pytest.mark.parametrize(
-    "start, end", [("18:25", "18:27"), ("18:25", "18:25")], ids=["short", "equal"]
+    "start, end, message",
+    [
+        ("18:25", "18:27", "minimum is 5"),
+        ("18:25", "18:25", "not after its start"),
+        ("11:00", "13:00", "noon to noon"),
+    ],
+    ids=["short", "equal", "spans-noon"],
 )
-def test_build_schedule_refuses_bad_durations(start, end):
+def test_build_schedule_refuses_bad_durations(start, end, message):
     t = _targets({**TRUNK, "start": start, "end": end})
-    with pytest.raises(PlanError, match="minutes|24 hours"):
+    with pytest.raises(PlanError, match=message):
         build_schedule(t, DENVER_5PM, None)
 
 
@@ -328,16 +402,36 @@ def test_build_schedule_warns_when_scope_zone_unknown_but_zone_given():
     assert any("zone" in w for w in s.warnings)
 
 
-def test_build_schedule_warns_when_defaulting_to_utc():
+def test_build_schedule_will_not_guess_a_utc_scope_zone():
+    # ALP's startup routine sets the scope's zone from its host (UTC on
+    # watcher); the ZWO app sets the phone's. A UTC default is not trusted.
     clock = _clock("2026-11-09T00:00:00", "Etc/UTC", "2026-11-09T00:00:00")
     t = _targets({**TRUNK, "start": "01:25", "end": "08:00"})
-    s = build_schedule(t, clock, None)
-    assert any("UTC" in w for w in s.warnings)
+    with pytest.raises(PlanError, match="pass timezone"):
+        build_schedule(t, clock, None)
+    assert build_schedule(t, clock, "UTC").timezone == "UTC"
 
 
 def test_build_schedule_rejects_unknown_timezone():
     with pytest.raises(PlanError, match="timezone"):
         build_schedule(_targets(TRUNK), DENVER_5PM, "Mars/Olympus")
+
+
+@pytest.mark.parametrize(
+    "wall, utc, night",
+    [
+        ("2026-11-08T12:00:00", "2026-11-08T19:00:00", date(2026, 11, 8)),
+        ("2026-11-08T23:00:00", "2026-11-09T06:00:00", date(2026, 11, 8)),
+        ("2026-11-09T11:59:00", "2026-11-09T18:59:00", date(2026, 11, 8)),
+    ],
+)
+def test_default_night_runs_noon_to_noon(wall, utc, night):
+    from zoneinfo import ZoneInfo
+
+    from seestar_mcp.plan_schedule import default_night
+
+    clock = _clock(wall, "America/Denver", utc)
+    assert default_night(clock.read_at, ZoneInfo("America/Denver")) == night
 
 
 def test_build_schedule_needs_targets():

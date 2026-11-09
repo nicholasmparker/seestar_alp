@@ -13,12 +13,14 @@ How the firmware times a plan (seestar-spec, spec/control/plan-scheduling.md):
   as last night's.
 - R22: a target whose end is within 60 s of now fails at once (code 513).
 
-So this module turns the person's wall-clock times into absolute instants and
-then into ``start_min`` relative to the scope's own ``n`` (from ``pi_get_time``).
-That keeps the schedule right whatever the scope's time zone, clock error or a
-daylight-saving change, provided the plan ends within 24 hours and no target
-overlaps the one before it. ``firmware_offsets`` replays R15 so the schedule
-returned to the caller is the one the firmware will run.
+So this module places each wall-clock time in one named night (noon to noon),
+turns it into an absolute instant, and then into ``start_min`` relative to the
+scope's own ``n`` (from ``pi_get_time``). That keeps the schedule right whatever
+the scope's time zone, clock error or a daylight-saving change, provided the
+plan ends within 24 hours and no target overlaps the one before it. Nothing is
+ever moved to another night: a target that does not fit is refused.
+``firmware_offsets`` replays R15 so the schedule returned to the caller is the
+one the firmware will run.
 """
 
 import math
@@ -228,6 +230,7 @@ class Schedule:
     timezone: str
     clock: ScopeClock
     targets: list[ScheduledTarget]
+    night_of: date
     warnings: list[str] = field(default_factory=list)
 
 
@@ -284,38 +287,37 @@ def _is_utc(zone: ZoneInfo) -> bool:
     return all(p.utcoffset() == timedelta(0) for p in probe)
 
 
-def _wall_instant(d: date, hm: time, zone: ZoneInfo, label: str) -> datetime:
-    """The UTC instant of wall time ``hm`` on ``d`` in ``zone``; refuses DST gaps."""
-    instant = datetime.combine(d, hm, tzinfo=zone).astimezone(UTC)
+NIGHT_SPLIT = time(12, 0)  # a night runs from noon to noon
+
+
+def default_night(now: datetime, zone: ZoneInfo) -> date:
+    """The night in progress or coming up: today after noon, else last night."""
+    local = now.astimezone(zone)
+    return local.date() if local.time() >= NIGHT_SPLIT else local.date() - timedelta(1)
+
+
+def _night_instant(
+    night_of: date, hm: time, zone: ZoneInfo, label: str, warnings: list[str]
+) -> datetime:
+    """The instant of wall time ``hm`` in the night of ``night_of`` (noon to noon).
+
+    Refuses a time skipped by a daylight-saving jump; for a time that happens
+    twice, takes the first and says so.
+    """
+    d = night_of if hm >= NIGHT_SPLIT else night_of + timedelta(1)
+    first = datetime.combine(d, hm, tzinfo=zone)
+    instant = first.astimezone(UTC)
     if instant.astimezone(zone).time() != hm:
         raise PlanError(
             [f"{label} {hm:%H:%M} does not exist on {d} in {zone.key} (clocks jump)"]
         )
+    second = first.replace(fold=1).astimezone(UTC)
+    if second != instant:
+        warnings.append(
+            f"{label} {hm:%H:%M} happens twice on {d} in {zone.key}; using the "
+            f"first ({first:%Z})"
+        )
     return instant
-
-
-def _next_at(
-    after: datetime, hm: time, zone: ZoneInfo, label: str, inclusive: bool
-) -> datetime:
-    """Earliest wall time ``hm`` in ``zone`` after (or at, if inclusive) ``after``."""
-    day = after.astimezone(zone).date()
-    for k in range(-1, 3):
-        d = day + timedelta(days=k)
-        candidate = datetime.combine(d, hm, tzinfo=zone).astimezone(UTC)
-        if candidate > after or (inclusive and candidate == after):
-            return _wall_instant(d, hm, zone, label)
-    raise AssertionError("unreachable: a wall time recurs within two days")
-
-
-def _latest_before(before: datetime, hm: time, zone: ZoneInfo, label: str) -> datetime:
-    """Latest wall time ``hm`` in ``zone`` strictly before ``before``."""
-    day = before.astimezone(zone).date()
-    for k in range(1, -3, -1):
-        d = day + timedelta(days=k)
-        candidate = datetime.combine(d, hm, tzinfo=zone).astimezone(UTC)
-        if candidate < before:
-            return _wall_instant(d, hm, zone, label)
-    raise AssertionError("unreachable: a wall time recurs within two days")
 
 
 def _check_clock(clock: ScopeClock, warnings: list[str]) -> list[str]:
@@ -338,37 +340,52 @@ def _check_clock(clock: ScopeClock, warnings: list[str]) -> list[str]:
     return []
 
 
-def build_schedule(
-    targets: list[PlanTarget], clock: ScopeClock, timezone: str | None
-) -> Schedule:
-    """Resolve wall-clock targets into the firmware schedule the scope will run.
-
-    Rules: targets run in list order. The first target's end is its next
-    occurrence after now and its start the latest one before that end, so a
-    target already under way starts now. Each later target starts at the first
-    occurrence of its start time at or after the previous target's start, must
-    not begin before the previous one ends, and ends at the next occurrence of
-    its end time. The whole plan must end within 24 hours.
-    """
-    if not targets:
-        raise PlanError(["a plan needs at least one target"])
-    warnings: list[str] = []
-    zone_name = timezone or clock.time_zone
-    zone = _zone(zone_name)
-    if zone is None:
-        if timezone:
+def _plan_zone(clock: ScopeClock, timezone: str | None) -> tuple[str, ZoneInfo]:
+    if timezone:
+        zone = _zone(timezone)
+        if zone is None:
             raise PlanError([f"timezone {timezone!r} is not a known IANA zone"])
+        return timezone, zone
+    zone = _zone(clock.time_zone)
+    if zone is None:
         raise PlanError(
             [
                 f"the scope's time zone {clock.time_zone!r} is not a known zone; pass "
                 "timezone (for example 'America/Denver') for the times you wrote"
             ]
         )
-    if timezone is None and _is_utc(zone):
-        warnings.append(
-            f"times were read as UTC, the scope's own zone ({zone_name}); pass "
-            "timezone if you meant local time"
+    if _is_utc(zone):
+        # ALP's startup routine sets the scope's zone from its host, often UTC,
+        # while the ZWO app sets the phone's zone: too unstable to guess from.
+        raise PlanError(
+            [
+                f"the scope's own zone is {clock.time_zone}, which may not be where "
+                "you are; pass timezone (for example 'America/Denver') for the "
+                "times you wrote"
+            ]
         )
+    return clock.time_zone, zone
+
+
+def build_schedule(
+    targets: list[PlanTarget],
+    clock: ScopeClock,
+    timezone: str | None,
+    night_of: date | None = None,
+) -> Schedule:
+    """Resolve wall-clock targets into the firmware schedule the scope will run.
+
+    Every time belongs to one night, noon to noon: on ``night_of`` from 12:00
+    and on the next day before 12:00. ``night_of`` defaults to the night in
+    progress or coming up (today after noon, else last night). Targets must be
+    in time order without overlaps. A target already under way starts now; one
+    that is over, or has less than 5 minutes left, is refused rather than moved
+    to another night. The plan must end within 24 hours.
+    """
+    if not targets:
+        raise PlanError(["a plan needs at least one target"])
+    warnings: list[str] = []
+    zone_name, zone = _plan_zone(clock, timezone)
     errors = _check_clock(clock, warnings)
     n = clock.seconds_since_midnight
     if n > DAY_S - MIDNIGHT_GUARD_S:
@@ -380,40 +397,58 @@ def build_schedule(
         raise PlanError(errors)
 
     now = clock.read_at
+    defaulted = night_of is None
+    night = default_night(now, zone) if night_of is None else night_of
     windows: list[tuple[datetime, datetime]] = []
     for i, t in enumerate(targets):
-        if i == 0:
-            end = _next_at(now, t.wall("end"), zone, f"{t.name} end", False)
-            start = _latest_before(end, t.wall("start"), zone, f"{t.name} start")
-        else:
-            prev_start, prev_end = windows[-1]
-            start = _next_at(prev_start, t.wall("start"), zone, f"{t.name} start", True)
-            if start < prev_end:
-                errors.append(
-                    f"{t.name} starts at {t.start}, before {targets[i - 1].name} ends "
-                    f"at {targets[i - 1].end}: targets must not overlap"
-                )
-            end = _next_at(start, t.wall("end"), zone, f"{t.name} end", False)
-        length = end - start
-        if length < MIN_TARGET:
-            minutes = length.total_seconds() / 60
+        start = _night_instant(
+            night, t.wall("start"), zone, f"{t.name} start", warnings
+        )
+        end = _night_instant(night, t.wall("end"), zone, f"{t.name} end", warnings)
+        if end <= start:
+            errors.append(
+                f"{t.name} ends at {t.end}, not after its start {t.start}, in the "
+                f"night of {night} (a night runs from noon to noon)"
+            )
+        elif end - start < MIN_TARGET:
+            minutes = (end - start).total_seconds() / 60
             errors.append(f"{t.name} runs {minutes:.0f} minutes; the minimum is 5")
-        elif length >= MAX_AHEAD:
-            errors.append(f"{t.name} must run less than 24 hours")
+        if i and start < windows[-1][1]:
+            prev = targets[i - 1]
+            errors.append(
+                f"{t.name} starts at {t.start}, before {prev.name} ends at "
+                f"{prev.end}: list targets in time order, without overlaps"
+            )
         windows.append((start, end))
     if errors:
         raise PlanError(errors)
 
-    last_end = windows[-1][1]
-    if last_end - now > MAX_AHEAD:
-        raise PlanError(
-            [
-                f"the plan would end at {last_end.astimezone(zone):%Y-%m-%d %H:%M} "
-                f"{zone_name}, more than 24 hours from now, which the firmware "
-                "cannot schedule. Targets run in list order; if the first targets "
-                "are already over tonight, leave them out"
-            ]
-        )
+    hint = (
+        f" (the night of {night} was assumed; pass night_of to plan another night)"
+        if defaulted
+        else ""
+    )
+    for t, (start, end) in zip(targets, windows, strict=True):
+        left = end - max(start, now)
+        if left <= timedelta(0):
+            errors.append(f"{t.name} ({t.start}-{t.end}) is already over{hint}")
+        elif left < MIN_TARGET:
+            minutes = left.total_seconds() / 60
+            errors.append(
+                f"{t.name} has only {minutes:.0f} minutes left; leave it out{hint}"
+            )
+    if errors:
+        raise PlanError(errors)
+
+    too_far = PlanError(
+        [
+            f"the plan would end at {windows[-1][1].astimezone(zone):%Y-%m-%d %H:%M} "
+            f"{zone_name}, more than 24 hours from now, which the firmware cannot "
+            f"schedule; send the night of {night} later"
+        ]
+    )
+    if windows[-1][1] - now > MAX_AHEAD:
+        raise too_far
 
     def minutes_at(instant: datetime) -> int:
         return math.floor((n + (instant - now).total_seconds()) / 60 + 0.5)
@@ -422,6 +457,8 @@ def build_schedule(
     for start, end in windows:
         start_min = n // 60 if start <= now else minutes_at(start)
         entries.append((start_min, minutes_at(end) - start_min))
+    if 60 * sum(entries[-1]) - n > DAY_S:  # rounding pushed the end past 24 h
+        raise too_far
     carry, shift, offsets = firmware_offsets(entries, n)
     if carry or shift:
         raise PlanError(
@@ -454,7 +491,7 @@ def build_schedule(
             zip(targets, offsets, entries, strict=True)
         )
     ]
-    return Schedule(zone_name, clock, scheduled, warnings)
+    return Schedule(zone_name, clock, scheduled, night, warnings)
 
 
 def view_plan_params(

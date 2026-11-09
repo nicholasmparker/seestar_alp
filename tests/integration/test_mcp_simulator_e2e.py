@@ -221,12 +221,21 @@ def test_shutdown_without_confirm_makes_no_device_call(tools_env, monkeypatch):
 
 def test_view_plan_round_trip(tools_env):
     """plan_night -> get_plan_status -> cancel_plan through ALP to the simulator."""
+    from seestar_mcp.plan_schedule import default_night
+
     now = datetime.now(UTC)
     if now.hour == 23 and now.minute >= 55:
         pytest.skip("plan_night refuses the minutes before the scope's midnight")
+    # A night runs noon to noon, so keep the 2-hour plan clear of noon (UTC,
+    # the simulator's zone).
+    base = now + timedelta(minutes=30)
+    noon = base.replace(hour=12, minute=0, second=0, microsecond=0)
+    if base < noon < base + timedelta(minutes=125):
+        base = noon + timedelta(minutes=5)
+    night = default_night(base, UTC).isoformat()
 
     def hhmm(minutes):
-        return (now + timedelta(minutes=minutes)).strftime("%H:%M")
+        return (base + timedelta(minutes=minutes - 30)).strftime("%H:%M")
 
     targets = [
         {
@@ -247,13 +256,15 @@ def test_view_plan_round_trip(tools_env):
         },
     ]
 
-    preview = _run(view_plan.plan_night_tool(targets, timezone="Etc/UTC"))
+    preview = _run(
+        view_plan.plan_night_tool(targets, timezone="Etc/UTC", night_of=night)
+    )
     assert preview["requires_confirmation"] is True, preview
     assert _run(view_plan.get_plan_status_tool())["state"] == "none"
 
     sent = _run(
         view_plan.plan_night_tool(
-            targets, exposure_s=20, timezone="Etc/UTC", confirm=True
+            targets, exposure_s=20, timezone="Etc/UTC", night_of=night, confirm=True
         )
     )
     assert sent["ok"] is True, sent
@@ -269,7 +280,11 @@ def test_view_plan_round_trip(tools_env):
     written = _run(settings.read_settings_tool())["setting"]["result"]
     assert written["exp_ms"]["stack_l"] == 20000, written
 
-    again = _run(view_plan.plan_night_tool(targets, timezone="Etc/UTC", confirm=True))
+    again = _run(
+        view_plan.plan_night_tool(
+            targets, timezone="Etc/UTC", night_of=night, confirm=True
+        )
+    )
     assert again["ok"] is False and "already running" in again["error"]
 
     cancelled = _run(view_plan.cancel_plan_tool())

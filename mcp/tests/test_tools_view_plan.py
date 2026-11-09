@@ -23,6 +23,7 @@ SCOPE_TIME = {
     "sec": 0,
     "time_zone": "America/Denver",
 }
+NIGHT = "2026-11-08"
 TARGETS = [
     {
         "name": "IC 1396A",
@@ -62,6 +63,11 @@ class FakeScope:
         self.replies: dict[str, object] = {}  # method -> canned reply override
         self.ignore_settings: set[str] = set()
         self.events: dict = {}
+        self.alp_schedule: dict = {"state": "stopped", "list": []}
+
+    async def get_schedule(self):
+        self.calls.append(("get_schedule", None))
+        return self.alp_schedule
 
     async def method_sync(self, method, params=None):
         self.calls.append((method, params))
@@ -141,7 +147,7 @@ async def test_plan_night_without_confirm_previews_and_changes_nothing(scope):
 
 
 async def test_plan_night_sends_settings_then_plan(scope):
-    out = await plan_night_tool(_targets(), exposure_s=20, confirm=True)
+    out = await plan_night_tool(_targets(), exposure_s=20, confirm=True, night_of=NIGHT)
     assert out["ok"] is True, out
     assert out["status"] == "accepted, not done"
     assert out["confirmed"] is True
@@ -167,7 +173,7 @@ async def test_plan_night_sends_settings_then_plan(scope):
 
 async def test_plan_night_leaves_exposure_alone_by_default(scope):
     out = await plan_night_tool(
-        _targets(), af_on_switch=False, close_arm=False, confirm=True
+        _targets(), af_on_switch=False, close_arm=False, confirm=True, night_of=NIGHT
     )
     assert out["ok"] is True, out
     assert not any(m == "set_setting" and "exp_ms" in p for m, p in scope.calls if p), (
@@ -177,9 +183,66 @@ async def test_plan_night_leaves_exposure_alone_by_default(scope):
     assert scope.settings["plan_target_af"] is False
 
 
+async def test_plan_night_confirm_needs_night_of_and_writes_nothing(scope):
+    out = await plan_night_tool(_targets(), confirm=True)
+    assert out["ok"] is False and "night_of='2026-11-08'" in out["error"]
+    assert out["night_of"] == NIGHT
+    assert scope.methods() == ["pi_get_time"]
+
+
+async def test_plan_night_preview_names_the_night(scope):
+    out = await plan_night_tool(_targets())
+    assert out["night_of"] == NIGHT and "night_of='2026-11-08'" in out["error"]
+
+
+async def test_plan_night_refuses_bad_night_of(scope):
+    out = await plan_night_tool(_targets(), night_of="tonight", confirm=True)
+    assert out["ok"] is False and scope.calls == []
+
+
+async def test_plan_night_late_confirm_cannot_arm_another_night(scope, monkeypatch):
+    # Previewed at 22:50 while M42 21:00-23:00 was under way; approved at 23:01.
+    late = [PlanTarget.model_validate({**TARGETS[0], "start": "21:00", "end": "23:00"})]
+    scope.time.update(hour=23, min=1)
+    monkeypatch.setattr(
+        view_plan, "_utcnow", lambda: datetime(2026, 11, 9, 6, 1, tzinfo=UTC)
+    )
+    out = await plan_night_tool(late, confirm=True, night_of=NIGHT)
+    assert out["ok"] is False and "already over" in out["error"]
+    assert "set_setting" not in scope.methods()
+
+
+async def test_plan_night_no_reply_but_plan_held_is_accepted(scope):
+    original = scope.method_sync
+
+    async def silent(method, params=None):
+        reply = await original(method, params)
+        if method == "set_view_plan":  # the scope took it, but ALP gave up waiting
+            return {"method": method, "params": params, "result": "Error: Exceeded"}
+        return reply
+
+    scope.method_sync = silent
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
+    assert out["ok"] is True and out["confirmed"] is True, out
+    assert any("no reply" in w for w in out["warnings"])
+
+
+async def test_plan_night_no_reply_and_no_plan_is_uncertain(scope):
+    scope.replies["set_view_plan"] = SSAlpConnectionError("Request timed out")
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
+    assert out["ok"] is False and out["uncertain"] is True
+    assert "get_plan_status" in out["hint"]
+
+
+async def test_plan_night_exposure_error_is_in_seconds(scope):
+    scope.ignore_settings = {"exp_ms"}
+    out = await plan_night_tool(_targets(), exposure_s=20, confirm=True, night_of=NIGHT)
+    assert out["ok"] is False and "exposure_s=20 " in out["error"]
+
+
 async def test_plan_night_validation_error_sends_nothing(scope):
     bad = [*_targets(), PlanTarget.model_validate({**TARGETS[1], "start": "04:00"})]
-    out = await plan_night_tool(bad, confirm=True)
+    out = await plan_night_tool(bad, confirm=True, night_of=NIGHT)
     assert out["ok"] is False
     assert "overlap" in out["error"]
     assert scope.methods() == ["pi_get_time"]
@@ -187,21 +250,34 @@ async def test_plan_night_validation_error_sends_nothing(scope):
 
 async def test_plan_night_refuses_when_a_plan_is_running(scope):
     scope.app_state["ViewPlan"] = {"state": "working", "plan": {"plan_name": "Old"}}
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is False and "cancel_plan" in out["error"]
     assert "set_setting" not in scope.methods()
 
 
 async def test_plan_night_refuses_when_view_is_running(scope):
     scope.app_state["View"] = {"state": "working", "stage": "Stack"}
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is False and "stop_view" in out["error"]
     assert "set_setting" not in scope.methods()
 
 
+@pytest.mark.parametrize("state", ["working", "stopping"])
+async def test_plan_night_refuses_while_alp_scheduler_runs(scope, state):
+    scope.alp_schedule = {"state": state, "list": [{"action": "start_mosaic"}]}
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
+    assert out["ok"] is False and "stop_scheduler" in out["error"]
+    assert "set_setting" not in scope.methods()
+
+
+async def test_plan_night_refuses_empty_plan_without_device_calls(scope):
+    out = await plan_night_tool([], confirm=True, night_of=NIGHT)
+    assert out["ok"] is False and scope.calls == []
+
+
 async def test_plan_night_refuses_when_app_state_unreadable(scope):
     scope.replies["iscope_get_app_state"] = SSAlpConnectionError("timed out")
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is False and "timed out" in out["error"]
     assert "set_setting" not in scope.methods()
 
@@ -212,7 +288,7 @@ async def test_plan_night_refuses_when_scope_time_unreadable(scope):
         "error": "fail to operate",
         "code": 207,
     }
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is False and "207" in out["error"]
     assert scope.methods() == ["pi_get_time"]
 
@@ -225,13 +301,13 @@ async def test_plan_night_alp_timeout_reply_is_an_error(scope):
         "id": 9,
         "result": "Error: Exceeded allotted wait time for result",
     }
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is False and "Exceeded" in out["error"]
 
 
 async def test_plan_night_falls_back_to_legacy_setting_names(scope):
     scope.ignore_settings = {"plan_target_af", "viewplan_gohome"}
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is True, out
     assert ("set_setting", {"plan": {"target_af": True}}) in scope.calls
     assert ("set_setting", {"viewplan_go_home": True}) in scope.calls
@@ -247,7 +323,7 @@ async def test_plan_night_does_not_send_plan_when_settings_unconfirmed(scope):
         return await FakeScope.method_sync(scope, method, params)
 
     scope.method_sync = stubborn
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is False
     assert "plan_target_af" in out["error"]
     assert "set_view_plan" not in scope.methods()
@@ -259,7 +335,7 @@ async def test_plan_night_reports_set_view_plan_rejection(scope):
         "error": "view plan is already running",
         "code": 536,
     }
-    out = await plan_night_tool(_targets(), exposure_s=20, confirm=True)
+    out = await plan_night_tool(_targets(), exposure_s=20, confirm=True, night_of=NIGHT)
     assert out["ok"] is False
     assert "536" in out["error"] and "cancel_plan" in out["hint"]
     assert "exposure_s" in out["changed"]
@@ -275,20 +351,24 @@ async def test_plan_night_unconfirmed_when_readback_differs(scope):
         return await original(method, params)
 
     scope.method_sync = stale
-    out = await plan_night_tool(_targets(), confirm=True)
+    out = await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     assert out["ok"] is True
     assert out["confirmed"] is False
     assert out["warnings"]
 
 
 async def test_plan_night_refuses_all_scopes(scope):
-    out = await plan_night_tool(_targets(), confirm=True, telescope_id=0)
+    out = await plan_night_tool(
+        _targets(), confirm=True, night_of=NIGHT, telescope_id=0
+    )
     assert out["ok"] is False and scope.calls == []
 
 
 @pytest.mark.parametrize("exposure_s", [0, -5, 601])
 async def test_plan_night_refuses_bad_exposure(scope, exposure_s):
-    out = await plan_night_tool(_targets(), exposure_s=exposure_s, confirm=True)
+    out = await plan_night_tool(
+        _targets(), exposure_s=exposure_s, confirm=True, night_of=NIGHT
+    )
     assert out["ok"] is False and scope.calls == []
 
 
@@ -366,12 +446,35 @@ async def test_get_plan_status_error_when_nothing_readable(scope):
 
 
 async def test_cancel_plan_clears_and_reports(scope):
-    await plan_night_tool(_targets(), confirm=True)
+    await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
     out = await cancel_plan_tool()
     assert out["ok"] is True
     assert "clear_view_plan" in scope.methods()
     assert out["status"]["state"] == "cancel"
     assert "plan_night" in out["note"]
+
+
+async def test_cancel_plan_no_reply_but_stopped_is_ok(scope):
+    await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
+    original = scope.method_sync
+
+    async def slow(method, params=None):
+        reply = await original(method, params)
+        if method == "clear_view_plan":
+            return {"ok": False, "error": "Request timed out"}
+        return reply
+
+    scope.method_sync = slow
+    out = await cancel_plan_tool()
+    assert out["ok"] is True and out["status"]["state"] == "cancel"
+
+
+async def test_cancel_plan_no_reply_and_still_running_is_uncertain(scope):
+    await plan_night_tool(_targets(), confirm=True, night_of=NIGHT)
+    scope.replies["clear_view_plan"] = SSAlpConnectionError("Request timed out")
+    out = await cancel_plan_tool()
+    assert out["ok"] is False and out["uncertain"] is True
+    assert out["status"]["state"] == "working"
 
 
 async def test_cancel_plan_reports_device_error(scope):
@@ -400,7 +503,8 @@ async def test_plan_night_through_fastmcp_with_json_targets(scope):
     from seestar_mcp.server import mcp
 
     content, structured = await mcp.call_tool(
-        "plan_night", {"targets": TARGETS, "exposure_s": 20, "confirm": True}
+        "plan_night",
+        {"targets": TARGETS, "exposure_s": 20, "confirm": True, "night_of": NIGHT},
     )
     assert structured["ok"] is True, structured
     assert [t["start_min"] for t in structured["targets"]] == [1105, 1500]

@@ -23,6 +23,7 @@ from seestar_mcp.plan_schedule import (  # noqa: E402
     PlanTarget,
     ScopeClock,
     build_schedule,
+    default_night,
     view_plan_params,
 )
 from seestar_mcp.server import make_client  # noqa: E402
@@ -78,12 +79,20 @@ def _zone(name):
         return None
 
 
-def _targets(zone, now, first_start_min=120):
-    def hhmm(minutes):
-        return (now + timedelta(minutes=minutes)).astimezone(zone).strftime("%H:%M")
+def _night_plan(zone, now, first_start_min=120):
+    """Two 1-hour targets from first_start_min ahead, kept clear of local noon
+    (a night runs noon to noon), and the night they belong to."""
+    base = now + timedelta(minutes=first_start_min)
+    local = base.astimezone(zone)
+    noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
+    if local < noon < local + timedelta(minutes=125):
+        base = noon + timedelta(minutes=5)
 
-    s = first_start_min
-    return [
+    def hhmm(minutes):
+        return (base + timedelta(minutes=minutes)).astimezone(zone).strftime("%H:%M")
+
+    s = 0
+    targets = [
         {
             "name": "M42",
             "ra": "05:35:17",
@@ -101,6 +110,7 @@ def _targets(zone, now, first_start_min=120):
             "lp_filter": False,
         },
     ]
+    return targets, default_night(base, zone)
 
 
 @pytest.fixture(scope="module")
@@ -131,11 +141,9 @@ def test_firmware_accepts_view_plan_payload(alp):
         now = datetime.now(UTC)
         clock = ScopeClock(now.replace(tzinfo=None), "Etc/UTC", now)
     zone = _zone(clock.time_zone)
-    targets = [
-        PlanTarget.model_validate(t)
-        for t in _targets(zone, clock.read_at, first_start_min=180)
-    ]
-    schedule = build_schedule(targets, clock, zone.key)
+    raw, night = _night_plan(zone, clock.read_at, first_start_min=180)
+    targets = [PlanTarget.model_validate(t) for t in raw]
+    schedule = build_schedule(targets, clock, zone.key, night)
     params = view_plan_params(schedule, "System test payload", True, True)
 
     reply = _method("set_view_plan", params)
@@ -161,14 +169,20 @@ def test_plan_night_end_to_end(alp):
     if clock.seconds_since_midnight > 86400 - 600:
         pytest.skip("too close to the scope's midnight for a stable test plan")
     zone = _zone(clock.time_zone)
-    tz_arg = None if zone is not None else "Etc/UTC"
-    targets = _targets(zone or ZoneInfo("Etc/UTC"), clock.read_at)
+    zone = zone or ZoneInfo("Etc/UTC")
+    tz_arg = zone.key  # always explicit, as K2 passes it
+    targets, night = _night_plan(zone, clock.read_at)
+    night_of = night.isoformat()
 
-    preview = _run(view_plan.plan_night_tool(targets, timezone=tz_arg))
+    preview = _run(
+        view_plan.plan_night_tool(targets, timezone=tz_arg, night_of=night_of)
+    )
     assert preview.get("requires_confirmation") is True, preview
 
     sent = _run(
-        view_plan.plan_night_tool(targets, exposure_s=10, timezone=tz_arg, confirm=True)
+        view_plan.plan_night_tool(
+            targets, exposure_s=10, timezone=tz_arg, night_of=night_of, confirm=True
+        )
     )
     assert sent["ok"] is True, sent
     assert sent["status"] == "accepted, not done"
@@ -178,7 +192,11 @@ def test_plan_night_end_to_end(alp):
     assert status["state"] == "working", status
     assert [t["name"] for t in status["targets"]] == ["M42", "M45"], status
 
-    again = _run(view_plan.plan_night_tool(targets, timezone=tz_arg, confirm=True))
+    again = _run(
+        view_plan.plan_night_tool(
+            targets, timezone=tz_arg, night_of=night_of, confirm=True
+        )
+    )
     assert again["ok"] is False and "already running" in again["error"], again
 
     cancelled = _run(view_plan.cancel_plan_tool())

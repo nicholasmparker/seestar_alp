@@ -140,15 +140,20 @@ plan_night(
          "start": "01:00", "end": "05:05", "lp_filter": False},
     ],
     timezone="America/Denver",   # the zone the HH:MM times are in
+    night_of="2026-11-08",       # the evening's date; a night runs noon to noon
     exposure_s=20, af_on_switch=True, close_arm=True, confirm=True,
 )
 ```
 
 - **Targets** take J2000 `ra` (hours or `HH:MM:SS`) and `dec` (degrees or
-  `+DD:MM:SS`), local `start`/`end` as `HH:MM`, and `lp_filter`. They run in
-  list order and must not overlap; an end earlier than its start is after
-  midnight. The plan must end within 24 hours. A target already under way starts
-  now. `timezone` defaults to the scope's own zone.
+  `+DD:MM:SS`), local `start`/`end` as `HH:MM`, and `lp_filter`. Every time
+  belongs to the night of `night_of`, which runs from noon to noon, so `01:00`
+  is the next morning. Targets must be in time order without overlaps, and the
+  plan must end within 24 hours. A target already under way starts now; one that
+  is over or has under 5 minutes left is refused, never moved to another night.
+- **Time zone.** Pass `timezone` for the times you wrote. Without it the tool
+  uses the scope's own zone, but refuses when that zone is UTC: seestar_alp's
+  startup routine sets the scope's zone from its host, which is often UTC.
 - **Timing.** The firmware counts a target's start in minutes after the scope's
   local midnight and turns that into a countdown when the plan starts. The tool
   reads the scope's clock (`pi_get_time`) and computes those minutes from it, so
@@ -168,8 +173,11 @@ plan_night(
 - **Filter.** Each target's goto puts the wheel on IR-cut, then a target with
   `lp_filter: true` moves it to LP.
 - **Confirmation.** Without `confirm=true`, `plan_night` only previews the
-  normalised schedule and changes nothing. With it, the reply means *accepted,
-  not done*, and includes a read-back of the plan the scope holds.
+  normalised schedule, including the night it resolved, and changes nothing.
+  `confirm=true` requires `night_of`, so a late confirmation cannot arm a
+  different night from the one approved. The reply means *accepted, not done*,
+  and includes a read-back of the plan the scope holds. If the scope does not
+  answer in time, the tool reads the plan back before reporting either way.
 - **Status.** `get_plan_status` reports the plan and each target's state and
   code. `complete` means the plan's loop finished, not that every target
   succeeded: a target whose end passed before it could run shows code 513.
