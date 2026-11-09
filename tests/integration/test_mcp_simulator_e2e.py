@@ -10,6 +10,7 @@ import socket
 import sys
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from seestar_mcp.tools import (  # noqa: E402
     settings,
     state,
     system,
+    view_plan,
 )
 
 SIMULATOR_SRC = Path(__file__).resolve().parents[2] / "simulator" / "src"
@@ -215,3 +217,62 @@ def test_shutdown_without_confirm_makes_no_device_call(tools_env, monkeypatch):
     result = _run(system.shutdown_tool(confirm=False))
     assert result["requires_confirmation"] is True
     assert result["ok"] is False
+
+
+def test_view_plan_round_trip(tools_env):
+    """plan_night -> get_plan_status -> cancel_plan through ALP to the simulator."""
+    now = datetime.now(UTC)
+    if now.hour == 23 and now.minute >= 55:
+        pytest.skip("plan_night refuses the minutes before the scope's midnight")
+
+    def hhmm(minutes):
+        return (now + timedelta(minutes=minutes)).strftime("%H:%M")
+
+    targets = [
+        {
+            "name": "M42",
+            "ra": "05:35:17",
+            "dec": "-05:23:28",
+            "start": hhmm(30),
+            "end": hhmm(90),
+            "lp_filter": True,
+        },
+        {
+            "name": "M45",
+            "ra": 3.7833,
+            "dec": 24.1167,
+            "start": hhmm(90),
+            "end": hhmm(150),
+            "lp_filter": False,
+        },
+    ]
+
+    preview = _run(view_plan.plan_night_tool(targets, timezone="Etc/UTC"))
+    assert preview["requires_confirmation"] is True, preview
+    assert _run(view_plan.get_plan_status_tool())["state"] == "none"
+
+    sent = _run(
+        view_plan.plan_night_tool(
+            targets, exposure_s=20, timezone="Etc/UTC", confirm=True
+        )
+    )
+    assert sent["ok"] is True, sent
+    assert sent["status"] == "accepted, not done"
+    assert sent["confirmed"] is True, sent
+    assert [t["duration_min"] for t in sent["targets"]] == [60, 60]
+
+    status = _run(view_plan.get_plan_status_tool())
+    assert status["state"] == "working", status
+    assert [t["name"] for t in status["targets"]] == ["M42", "M45"]
+    assert status["plan_target_af"] is True and status["viewplan_gohome"] is True
+
+    written = _run(settings.read_settings_tool())["setting"]["result"]
+    assert written["exp_ms"]["stack_l"] == 20000, written
+
+    again = _run(view_plan.plan_night_tool(targets, timezone="Etc/UTC", confirm=True))
+    assert again["ok"] is False and "already running" in again["error"]
+
+    cancelled = _run(view_plan.cancel_plan_tool())
+    assert cancelled["ok"] is True, cancelled
+    assert cancelled["status"]["state"] == "cancel"
+    assert {t["code"] for t in cancelled["status"]["targets"]} == {253}
