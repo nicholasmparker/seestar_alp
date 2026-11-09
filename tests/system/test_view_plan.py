@@ -11,23 +11,25 @@ plan worker only sleeps, so no goto or capture happens.
 """
 
 import asyncio
+import concurrent.futures
 import time
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
 
-pytest.importorskip("seestar_mcp")
-
-from seestar_mcp.plan_schedule import (  # noqa: E402
+# Imported outright, not importorskip: under --target a missing MCP package must
+# fail the lane rather than let it pass with these tests skipped. Without
+# --target, conftest.py does not collect this module at all.
+from seestar_mcp.plan_schedule import (
     PlanTarget,
     ScopeClock,
     build_schedule,
     default_night,
     view_plan_params,
 )
-from seestar_mcp.server import make_client  # noqa: E402
-from seestar_mcp.tools import imaging, view_plan  # noqa: E402
+from seestar_mcp.server import make_client
+from seestar_mcp.tools import imaging, view_plan
 
 pytestmark = pytest.mark.system
 
@@ -35,10 +37,18 @@ DEVICE_NUM = 1
 
 
 def _run(coro, timeout=120):
+    """Run a tool coroutine to completion from these synchronous tests.
+
+    Playwright's sync API (test_flow.py, same session) leaves an event loop
+    running in the main thread, where asyncio.run() refuses to start, so each
+    call gets a fresh loop in a worker thread.
+    """
+
     async def _bounded():
         return await asyncio.wait_for(coro, timeout)
 
-    return asyncio.run(_bounded())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, _bounded()).result()
 
 
 def _method(method, params=None):
