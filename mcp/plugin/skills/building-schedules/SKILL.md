@@ -5,6 +5,15 @@ description: Use when the user wants a multi-target, mosaic, or unattended imagi
 
 # Building schedules
 
+## Prefer an on-device night plan
+For a timed multi-target night, use `plan_night`: the scope runs the plan itself (like the ZWO app's Plan), so nothing has to stay connected overnight. ALP's scheduler below needs seestar_alp up all night, and its `wait_until` times use the ALP host's clock.
+1. Work out each target's window (see "Planning a whole night"). Give `ra`/`dec` in J2000, `start`/`end` as local `HH:MM`, `lp_filter` per target, and pass `timezone` (for example `America/Denver`) for the times you wrote.
+2. Exposure and gain are global, not per target: pass `exposure_s` once for the plan. Gain follows the scope's own setting.
+3. Call `plan_night` without `confirm` to preview the normalised schedule. Show it to the user, then call again with `confirm=true` only after they approve it.
+4. The reply means accepted, not done. Check `get_plan_status`; `complete` does not mean every target succeeded, so read each target's state and code. `cancel_plan` stops it (and deletes the stored plan on firmware 9.75).
+
+## ALP scheduler
+
 1. **Inspect.** `get_schedule` to see what already exists. Do not clobber a schedule the user wants to keep; ask first.
 2. **Create.** `create_schedule` starts a new empty schedule.
 3. **Add items.**
