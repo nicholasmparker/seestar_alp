@@ -1456,6 +1456,170 @@ def test_mosaic_goto_inner_worker_paths(monkeypatch, seestar):
     assert seestar.mosaic_goto_inner_worker(1.0, 2.0, "x", True, True) is True
 
 
+class FakeLpScope:
+    """Scope stand-in for the LP filter setting.
+
+    `drop_sets` set_setting calls are ignored (as the firmware did on 2026-11-09 when the
+    setting arrived during a dark capture), and any set sent while a dark library is
+    "working" is ignored too. The dark finishes after `dark_ticks` one-second sleeps.
+    """
+
+    def __init__(self, seestar, lenhance=False, drop_sets=0, dark_ticks=0):
+        self.seestar = seestar
+        self.lenhance = lenhance
+        self.drop_sets = drop_sets
+        self.dark_ticks = dark_ticks
+        self.sets = []
+        if dark_ticks:
+            seestar.event_state["DarkLibrary"] = {
+                "Event": "DarkLibrary",
+                "state": "working",
+            }
+
+    def sync(self, payload):
+        method = payload["method"]
+        if method == "get_setting":
+            return {
+                "method": method,
+                "result": {"stack_lenhance": self.lenhance},
+                "code": 0,
+            }
+        if method == "set_setting" and "stack_lenhance" in payload["params"]:
+            dark = (
+                self.seestar.event_state.get("DarkLibrary", {}).get("state")
+                == "working"
+            )
+            self.sets.append((payload["params"]["stack_lenhance"], dark))
+            if self.drop_sets > 0:
+                self.drop_sets -= 1
+            elif not dark:
+                self.lenhance = payload["params"]["stack_lenhance"]
+            return {"method": method, "result": 0, "code": 0}
+        return {"method": method, "result": 0, "code": 0}
+
+    def sleep(self, seconds):
+        if self.dark_ticks > 0:
+            self.dark_ticks -= 1
+            if self.dark_ticks == 0:
+                self.seestar.event_state["DarkLibrary"] = {
+                    "Event": "DarkLibrary",
+                    "state": "complete",
+                }
+
+
+def _install_lp_scope(monkeypatch, seestar, **kwargs):
+    scope = FakeLpScope(seestar, **kwargs)
+    monkeypatch.setattr(seestar, "send_message_param_sync", scope.sync)
+    monkeypatch.setattr("device.seestar_device.time.sleep", scope.sleep)
+    return scope
+
+
+def test_ensure_lp_filter_waits_out_a_dark_capture_before_setting(monkeypatch, seestar):
+    scope = _install_lp_scope(monkeypatch, seestar, dark_ticks=5)
+
+    assert seestar.ensure_lp_filter(True) is True
+    assert scope.lenhance is True
+    # the set went out only after the dark capture had finished
+    assert scope.sets == [(True, False)]
+
+
+def test_ensure_lp_filter_retries_when_the_scope_drops_the_setting(
+    monkeypatch, seestar
+):
+    scope = _install_lp_scope(monkeypatch, seestar, drop_sets=2)
+
+    assert seestar.ensure_lp_filter(True) is True
+    assert scope.lenhance is True
+    assert len(scope.sets) == 3
+
+
+def test_ensure_lp_filter_reports_failure_when_the_setting_never_takes(
+    monkeypatch, seestar
+):
+    scope = _install_lp_scope(monkeypatch, seestar, drop_sets=99)
+
+    assert seestar.ensure_lp_filter(True) is False
+    assert scope.lenhance is False
+    assert len(scope.sets) == Seestar.LP_FILTER_SET_TRIES
+
+
+def test_ensure_lp_filter_sends_nothing_when_already_right(monkeypatch, seestar):
+    scope = _install_lp_scope(monkeypatch, seestar, lenhance=True)
+
+    assert seestar.ensure_lp_filter(True) is True
+    assert scope.sets == []
+
+
+def test_ensure_lp_filter_turns_it_off_too(monkeypatch, seestar):
+    scope = _install_lp_scope(monkeypatch, seestar, lenhance=True)
+
+    assert seestar.ensure_lp_filter(False) is True
+    assert scope.lenhance is False
+
+
+def test_ensure_lp_filter_accepts_firmware_that_does_not_report_it(
+    monkeypatch, seestar
+):
+    sent = []
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        seestar,
+        "send_message_param_sync",
+        lambda p: sent.append(p["method"]) or {"result": "ok"},
+    )
+
+    assert seestar.ensure_lp_filter(True) is True
+    assert sent.count("set_setting") == 1
+
+
+def test_wait_for_dark_library_gives_up_after_timeout(monkeypatch, seestar):
+    clock = {"t": 0.0}
+    seestar.event_state["DarkLibrary"] = {"Event": "DarkLibrary", "state": "working"}
+    monkeypatch.setattr("device.seestar_device.time.monotonic", lambda: clock["t"])
+    monkeypatch.setattr(
+        "device.seestar_device.time.sleep",
+        lambda s: clock.__setitem__("t", clock["t"] + s),
+    )
+
+    assert seestar._wait_for_dark_library(10) is False
+    assert clock["t"] > 10
+
+
+def test_mosaic_goto_inner_worker_rechecks_lp_after_autofocus(monkeypatch, seestar):
+    seestar.event_state["scheduler"] = {"cur_scheduler_item": {}}
+    scope = _install_lp_scope(monkeypatch, seestar)
+    monkeypatch.setattr(seestar, "goto_target", lambda _p: True)
+    monkeypatch.setattr(seestar, "wait_end_op", lambda _e: True)
+
+    def autofocus_that_resets_lp(_n):
+        scope.lenhance = False  # e.g. a dark capture during focus lost the setting
+        return True
+
+    monkeypatch.setattr(seestar, "try_auto_focus", autofocus_that_resets_lp)
+
+    assert seestar.mosaic_goto_inner_worker(1.0, 2.0, "x", True, True) is True
+    assert scope.lenhance is True
+    assert len(scope.sets) == 2
+    assert (
+        "lp_filter_warning"
+        not in seestar.event_state["scheduler"]["cur_scheduler_item"]
+    )
+
+
+def test_mosaic_goto_inner_worker_flags_an_unconfirmed_lp_filter(monkeypatch, seestar):
+    seestar.event_state["scheduler"] = {"cur_scheduler_item": {}}
+    _install_lp_scope(monkeypatch, seestar, drop_sets=99)
+    monkeypatch.setattr(seestar, "goto_target", lambda _p: True)
+    monkeypatch.setattr(seestar, "wait_end_op", lambda _e: True)
+
+    # keeps imaging, but the scheduler state says the filter is in doubt
+    assert seestar.mosaic_goto_inner_worker(1.0, 2.0, "x", False, True) is True
+    warning = seestar.event_state["scheduler"]["cur_scheduler_item"][
+        "lp_filter_warning"
+    ]
+    assert "LP filter could not be confirmed on" in warning
+
+
 def test_udp_intro_and_heartbeat_helpers(monkeypatch, seestar):
     class UdpSock:
         def __init__(self):

@@ -2089,6 +2089,94 @@ class Seestar:
         self.mosaic_thread.start()
         return "spectra mosiac started"
 
+    # The LP filter is the `stack_lenhance` setting. A set_setting that reaches the
+    # scope while it is capturing a dark library can be lost without an error: on
+    # 2026-11-09 a mosaic sent it one second after the scope began a dark for a new
+    # exposure, the scope kept reporting it off, and a whole LP panel was shot through
+    # the IR-cut filter. So the scheduler waits out a dark, reads the setting back,
+    # and tries again, instead of sending it once and moving on.
+    LP_FILTER_SET_TRIES = 4
+    LP_FILTER_SETTLE_S = 2
+    DARK_LIBRARY_WAIT_S = 420
+
+    def _dark_library_working(self) -> bool:
+        with self.event_state_lock:
+            event = self.event_state.get("DarkLibrary")
+            return isinstance(event, dict) and event.get("state") == "working"
+
+    def _wait_for_dark_library(self, timeout_s: float) -> bool:
+        """Wait while the scope captures a dark library; False if it outlasts timeout_s."""
+        if not self._dark_library_working():
+            return True
+        self.logger.info("Waiting for the scope's dark library capture to finish.")
+        deadline = time.monotonic() + timeout_s
+        while self._dark_library_working():
+            if time.monotonic() > deadline:
+                self.logger.warning(
+                    f"Dark library capture still running after {timeout_s}s; continuing."
+                )
+                return False
+            time.sleep(1)
+        return True
+
+    def _read_lp_filter_setting(self) -> bool | None:
+        """The scope's current stack_lenhance, or None if this firmware does not report it."""
+        response = self.send_message_param_sync({"method": "get_setting"})
+        result = response.get("result") if isinstance(response, dict) else None
+        if isinstance(result, dict) and "stack_lenhance" in result:
+            return bool(result["stack_lenhance"])
+        return None
+
+    def ensure_lp_filter(self, want: bool) -> bool:
+        """Make the scope's LP filter setting match `want`, and confirm it.
+
+        Reads the setting first and sends set_setting only when it differs, so a check
+        that finds it already right moves nothing. Returns True when confirmed, or when
+        the firmware does not report the setting (nothing to check against). Returns
+        False, after logging an error, when the scope still reports the wrong value
+        after LP_FILTER_SET_TRIES attempts.
+        """
+        wanted = "on" if want else "off"
+        for attempt in range(1, self.LP_FILTER_SET_TRIES + 1):
+            self._wait_for_dark_library(self.DARK_LIBRARY_WAIT_S)
+            reported = self._read_lp_filter_setting()
+            if reported == want:
+                self.logger.info(f"LP filter {wanted} confirmed by get_setting.")
+                return True
+            if reported is None and attempt > 1:
+                self.logger.warning(
+                    f"LP filter {wanted} not verified: get_setting does not report stack_lenhance."
+                )
+                return True
+            if reported is not None:
+                self.logger.info(
+                    f"LP filter is {'on' if reported else 'off'}, setting it {wanted} "
+                    f"(attempt {attempt} of {self.LP_FILTER_SET_TRIES})."
+                )
+            response = self.send_message_param_sync(
+                {"method": "set_setting", "params": {"stack_lenhance": want}}
+            )
+            self.logger.info(f"LP filter {wanted}: set_setting reply: {response}")
+            time.sleep(self.LP_FILTER_SETTLE_S)
+        self._wait_for_dark_library(self.DARK_LIBRARY_WAIT_S)
+        reported = self._read_lp_filter_setting()
+        if reported == want or reported is None:
+            return True
+        self.logger.error(
+            f"LP filter could not be set {wanted}: the scope still reports it "
+            f"{'on' if reported else 'off'} after {self.LP_FILTER_SET_TRIES} attempts."
+        )
+        return False
+
+    def _note_lp_filter_problem(self, want: bool) -> None:
+        msg = (
+            f"LP filter could not be confirmed {'on' if want else 'off'}; "
+            "this panel may be using the wrong filter."
+        )
+        cur_item = self.event_state.get("scheduler", {}).get("cur_scheduler_item")
+        if isinstance(cur_item, dict):
+            cur_item["lp_filter_warning"] = msg
+
     def mosaic_goto_inner_worker(
         self,
         cur_ra: float,
@@ -2115,14 +2203,17 @@ class Seestar:
 
         time.sleep(3)
 
-        self.send_message_param_sync(
-            {"method": "set_setting", "params": {"stack_lenhance": is_use_LP_filter}}
-        )
+        lp_ok = self.ensure_lp_filter(is_use_LP_filter)
         if is_use_autofocus:
             self.event_state["scheduler"]["cur_scheduler_item"]["action"] = (
                 "auto focusing"
             )
             result = self.try_auto_focus(2)
+            # A dark capture can start during autofocus too: check again before stacking.
+            lp_ok = self.ensure_lp_filter(is_use_LP_filter)
+        if not lp_ok:
+            # Keep imaging (the data still has value) but make the mismatch visible.
+            self._note_lp_filter_problem(is_use_LP_filter)
         if not result:
             self.logger.info(
                 "Failed to auto focus, but will continue to image panel anyway."
