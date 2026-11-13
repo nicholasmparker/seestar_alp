@@ -2827,11 +2827,12 @@ class Seestar:
                 )
                 if item_id == targeted_item_id:
                     self.logger.warning(
-                        "Cannot insert schedule item that has already been executed"
+                        "Cannot replace schedule item that has already been executed"
                     )
                     return self.schedule
                 if item_id == active_schedule_item_id:
                     reached_cur_item = True
+                index += 1
 
         while index < len(self.schedule["list"]):
             item = self.schedule["list"][index]

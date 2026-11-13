@@ -2,6 +2,7 @@ import collections
 import json
 import logging
 import socket
+import threading
 import time
 from types import SimpleNamespace
 
@@ -31,6 +32,48 @@ class DummyLogger:
 @pytest.fixture
 def seestar():
     return Seestar(DummyLogger(), "127.0.0.1", 4700, "TestScope", 1, True)
+
+
+def _running_schedule(seestar, current_index):
+    """Three wait_for items; the schedule is working and on item current_index. Returns the item ids."""
+    seestar.schedule["list"].clear()
+    for sec in (1, 2, 3):
+        seestar.add_schedule_item({"action": "wait_for", "params": {"timer_sec": sec}})
+    ids = [i["schedule_item_id"] for i in seestar.schedule["list"]]
+    seestar.schedule["state"] = "working"
+    seestar.schedule["current_item_id"] = ids[current_index]
+    return ids
+
+
+def _returns_within(fn, seconds=2.0):
+    """Run fn in a daemon thread; True if it returned in time (a hang fails the test, not the suite)."""
+    done = threading.Event()
+    threading.Thread(target=lambda: (fn(), done.set()), daemon=True).start()
+    return done.wait(seconds)
+
+
+def test_replace_schedule_item_replaces_pending_item_while_running(seestar):
+    ids = _running_schedule(seestar, current_index=1)
+
+    assert _returns_within(
+        lambda: seestar.replace_schedule_item(
+            {"item_id": ids[2], "action": "wait_for", "params": {"timer_sec": 9}}
+        )
+    ), "replace_schedule_item did not return"
+    assert seestar.schedule["list"][2]["params"]["timer_sec"] == 9
+    assert seestar.schedule["list"][1]["schedule_item_id"] == ids[1]
+
+
+def test_replace_schedule_item_refuses_current_item_while_running(seestar):
+    ids = _running_schedule(seestar, current_index=1)
+
+    assert _returns_within(
+        lambda: seestar.replace_schedule_item(
+            {"item_id": ids[1], "action": "wait_for", "params": {"timer_sec": 9}}
+        )
+    ), "replace_schedule_item did not return"
+    assert seestar.schedule["list"][1]["schedule_item_id"] == ids[1]
+    assert seestar.schedule["list"][1]["params"]["timer_sec"] == 2
 
 
 def test_should_inject_verify_respects_config_and_firmware(seestar):
