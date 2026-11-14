@@ -1279,7 +1279,15 @@ class Seestar:
         self.mark_op_state("goto_target", "stopped")
 
         result = self.send_message_param_sync(data)
-        return "error" not in result
+        if "error" in result:
+            # The scope refused, so no AutoGoto events will arrive to clear the mark set above. Clear it
+            # here, or every later goto is refused locally as "mount is in goto routine".
+            self.logger.warning(
+                f"{self.device_name}: the scope rejected the goto: {result}"
+            )
+            self.mark_goto_status_as_stopped()
+            return False
+        return True
 
     # {"method":"scope_goto","params":{"ra":1.2345,"dec":75.0}}
     def _slew_to_ra_dec(self, params):
@@ -2492,9 +2500,17 @@ class Seestar:
         center_RA = parsed_coord.ra.hour
         center_Dec = parsed_coord.dec.deg
 
+        # The settings are only logged below. A scope that has just rebooted can time out or return an
+        # error here, and that must not stop the mosaic (or the scheduler thread).
         response = self.send_message_param_sync({"method": "get_setting"})
-        result = response["result"]
-        self.logger.info(f"get_setting response: {result}")
+        result = response.get("result") if isinstance(response, dict) else None
+        if isinstance(result, dict):
+            self.logger.info(f"get_setting response: {result}")
+        else:
+            self.logger.warning(
+                f"get_setting failed ({response}); starting the mosaic without the scope's current settings"
+            )
+            result = {}
 
         # print input requests
         self.logger.info("received parameters:")
@@ -3096,149 +3112,162 @@ class Seestar:
             )
             self.schedule["item_number"] = index + 1
             action = cur_schedule_item["action"]
-            if action == "start_mosaic":
-                self.start_mosaic_item(cur_schedule_item["params"])
-                while self.is_cur_scheduler_item_working:
-                    update_time()
-                    time.sleep(2)
-            elif action == "start_framed_mosaic":
-                self.start_framed_mosaic_item(cur_schedule_item["params"])
-                while self.is_cur_scheduler_item_working:
-                    update_time()
-                    time.sleep(2)
-            elif action == "start_spectra":
-                self.start_spectra_item(cur_schedule_item["params"])
-                while self.is_cur_scheduler_item_working:
-                    update_time()
-                    time.sleep(2)
-            elif action == "auto_focus":
-                item_state: SchedulerItemState = {
-                    "type": "auto_focus",
-                    "schedule_item_id": self.schedule["current_item_id"],
-                    "action": "auto focus",
-                }
-                self.update_scheduler_state_obj(item_state)
-                # Ensure the device is in star-view mode before requesting AF.
-                # Newer firmware (7.06+) requires this; older firmware was lenient.
-                self.send_message_param_sync(
-                    {"method": "iscope_start_view", "params": {"mode": "star"}}
-                )
-                time.sleep(2)
-                self.try_auto_focus(cur_schedule_item["params"]["try_count"])
-            elif action == "adjust_focus":
-                item_state: SchedulerItemState = {
-                    "type": "adjust_focus",
-                    "schedule_item_id": self.schedule["current_item_id"],
-                    "action": "adjust focus",
-                }
-                self.update_scheduler_state_obj(item_state)
-                self.adjust_focus(cur_schedule_item["params"]["steps"])
-            elif action == "shutdown":
-                item_state: SchedulerItemState = {
-                    "type": "shut_down",
-                    "schedule_item_id": self.schedule["current_item_id"],
-                    "action": "shut down",
-                }
-                self.update_scheduler_state_obj(item_state)
-                self.schedule["state"] = "stopped"
-                issue_shutdown = True
-                break
-            elif action == "wait_for":
-                sleep_time = cur_schedule_item["params"]["timer_sec"]
-                item_state: SchedulerItemState = {
-                    "type": "wait_for",
-                    "schedule_item_id": self.schedule["current_item_id"],
-                    "action": f"wait for {sleep_time} seconds",
-                    "remaining s": sleep_time,
-                }
-                self.update_scheduler_state_obj(item_state)
-                sleep_count = 0
-                while sleep_count < sleep_time and self.schedule["state"] == "working":
-                    if self.schedule["is_skip_requested"]:
-                        self.logger.info("requested to skip. Stopping wait_for.")
-                        break
-                    update_time()
-                    time.sleep(5)
-                    sleep_count += 5
-                    self.event_state["scheduler"]["cur_scheduler_item"][
-                        "remaining s"
-                    ] = sleep_time - sleep_count
-
-            elif action == "wait_until":
-                wait_until_time = cur_schedule_item["params"]["local_time"].split(":")
-                wait_until_hour = int(wait_until_time[0])
-                wait_until_minute = int(wait_until_time[1])
-                local_time = local_time = datetime.now()
-                item_state: SchedulerItemState = {
-                    "type": "wait_until",
-                    "schedule_item_id": self.schedule["current_item_id"],
-                    "action": f"wait until local time of {cur_schedule_item['params']['local_time']}",
-                }
-                self.update_scheduler_state_obj(item_state)
-                while self.schedule["state"] == "working":
-                    update_time()
-                    local_time = datetime.now()
-                    if (
-                        local_time.hour == wait_until_hour
-                        and local_time.minute == wait_until_minute
-                    ):
-                        break
-                    elif self.schedule["is_skip_requested"]:
-                        self.logger.info("requested to skip. Stopping wait_until.")
-                        break
-                    time.sleep(5)
-                    self.event_state["scheduler"]["cur_scheduler_item"][
-                        "current time"
-                    ] = f"{local_time.hour:02d}:{local_time.minute:02d}"
-            elif action == "start_up_sequence":
-                item_state: SchedulerItemState = {
-                    "type": "start up",
-                    "schedule_item_id": self.schedule["current_item_id"],
-                    "action": "start up",
-                }
-                self.update_scheduler_state_obj(item_state)
-                # self.start_up_thread_fn(cur_schedule_item['params'])
-                startup_thread = threading.Thread(
-                    name=f"start-up-thread:{self.device_name}",
-                    target=lambda: self.start_up_thread_fn(
-                        cur_schedule_item["params"], True
-                    ),
-                )
-                startup_thread.start()
-                time.sleep(2)
-                while startup_thread.is_alive():
-                    update_time()
-                    if self.schedule["state"] != "working":
-                        self.logger.info(
-                            "Scheduler stopped while start_up_sequence was running; exiting startup wait."
-                        )
-                        break
-                    time.sleep(2)
-            elif action == "action_set_dew_heater":
-                self.logger.info(
-                    f"Trying to set dew heater to {cur_schedule_item['params']}"
-                )
-                self.action_set_dew_heater(cur_schedule_item["params"])
-            elif action == "action_set_exposure":
-                item_state: SchedulerItemState = {
-                    "type": "action_set_exposure",
-                    "schedule_item_id": self.schedule["current_item_id"],
-                    "action": "set exposure",
-                }
-                self.update_scheduler_state_obj(item_state)
-                self.logger.info(
-                    f"Trying to set exposure to {cur_schedule_item['params']}"
-                )
-                self.action_set_exposure(cur_schedule_item["params"])
-            else:
-                if "params" in cur_schedule_item:
-                    request: MessageParams = {
-                        "method": action,
-                        "params": cur_schedule_item["params"],
+            # One failing item must not kill this thread: the schedule would keep reporting "working"
+            # with nothing running it, and start_scheduler refuses to start over until someone stops it.
+            try:
+                if action == "start_mosaic":
+                    self.start_mosaic_item(cur_schedule_item["params"])
+                    while self.is_cur_scheduler_item_working:
+                        update_time()
+                        time.sleep(2)
+                elif action == "start_framed_mosaic":
+                    self.start_framed_mosaic_item(cur_schedule_item["params"])
+                    while self.is_cur_scheduler_item_working:
+                        update_time()
+                        time.sleep(2)
+                elif action == "start_spectra":
+                    self.start_spectra_item(cur_schedule_item["params"])
+                    while self.is_cur_scheduler_item_working:
+                        update_time()
+                        time.sleep(2)
+                elif action == "auto_focus":
+                    item_state: SchedulerItemState = {
+                        "type": "auto_focus",
+                        "schedule_item_id": self.schedule["current_item_id"],
+                        "action": "auto focus",
                     }
+                    self.update_scheduler_state_obj(item_state)
+                    # Ensure the device is in star-view mode before requesting AF.
+                    # Newer firmware (7.06+) requires this; older firmware was lenient.
+                    self.send_message_param_sync(
+                        {"method": "iscope_start_view", "params": {"mode": "star"}}
+                    )
+                    time.sleep(2)
+                    self.try_auto_focus(cur_schedule_item["params"]["try_count"])
+                elif action == "adjust_focus":
+                    item_state: SchedulerItemState = {
+                        "type": "adjust_focus",
+                        "schedule_item_id": self.schedule["current_item_id"],
+                        "action": "adjust focus",
+                    }
+                    self.update_scheduler_state_obj(item_state)
+                    self.adjust_focus(cur_schedule_item["params"]["steps"])
+                elif action == "shutdown":
+                    item_state: SchedulerItemState = {
+                        "type": "shut_down",
+                        "schedule_item_id": self.schedule["current_item_id"],
+                        "action": "shut down",
+                    }
+                    self.update_scheduler_state_obj(item_state)
+                    self.schedule["state"] = "stopped"
+                    issue_shutdown = True
+                    break
+                elif action == "wait_for":
+                    sleep_time = cur_schedule_item["params"]["timer_sec"]
+                    item_state: SchedulerItemState = {
+                        "type": "wait_for",
+                        "schedule_item_id": self.schedule["current_item_id"],
+                        "action": f"wait for {sleep_time} seconds",
+                        "remaining s": sleep_time,
+                    }
+                    self.update_scheduler_state_obj(item_state)
+                    sleep_count = 0
+                    while (
+                        sleep_count < sleep_time and self.schedule["state"] == "working"
+                    ):
+                        if self.schedule["is_skip_requested"]:
+                            self.logger.info("requested to skip. Stopping wait_for.")
+                            break
+                        update_time()
+                        time.sleep(5)
+                        sleep_count += 5
+                        self.event_state["scheduler"]["cur_scheduler_item"][
+                            "remaining s"
+                        ] = sleep_time - sleep_count
+
+                elif action == "wait_until":
+                    wait_until_time = cur_schedule_item["params"]["local_time"].split(
+                        ":"
+                    )
+                    wait_until_hour = int(wait_until_time[0])
+                    wait_until_minute = int(wait_until_time[1])
+                    local_time = local_time = datetime.now()
+                    item_state: SchedulerItemState = {
+                        "type": "wait_until",
+                        "schedule_item_id": self.schedule["current_item_id"],
+                        "action": f"wait until local time of {cur_schedule_item['params']['local_time']}",
+                    }
+                    self.update_scheduler_state_obj(item_state)
+                    while self.schedule["state"] == "working":
+                        update_time()
+                        local_time = datetime.now()
+                        if (
+                            local_time.hour == wait_until_hour
+                            and local_time.minute == wait_until_minute
+                        ):
+                            break
+                        elif self.schedule["is_skip_requested"]:
+                            self.logger.info("requested to skip. Stopping wait_until.")
+                            break
+                        time.sleep(5)
+                        self.event_state["scheduler"]["cur_scheduler_item"][
+                            "current time"
+                        ] = f"{local_time.hour:02d}:{local_time.minute:02d}"
+                elif action == "start_up_sequence":
+                    item_state: SchedulerItemState = {
+                        "type": "start up",
+                        "schedule_item_id": self.schedule["current_item_id"],
+                        "action": "start up",
+                    }
+                    self.update_scheduler_state_obj(item_state)
+                    # self.start_up_thread_fn(cur_schedule_item['params'])
+                    startup_thread = threading.Thread(
+                        name=f"start-up-thread:{self.device_name}",
+                        target=lambda: self.start_up_thread_fn(
+                            cur_schedule_item["params"], True
+                        ),
+                    )
+                    startup_thread.start()
+                    time.sleep(2)
+                    while startup_thread.is_alive():
+                        update_time()
+                        if self.schedule["state"] != "working":
+                            self.logger.info(
+                                "Scheduler stopped while start_up_sequence was running; exiting startup wait."
+                            )
+                            break
+                        time.sleep(2)
+                elif action == "action_set_dew_heater":
+                    self.logger.info(
+                        f"Trying to set dew heater to {cur_schedule_item['params']}"
+                    )
+                    self.action_set_dew_heater(cur_schedule_item["params"])
+                elif action == "action_set_exposure":
+                    item_state: SchedulerItemState = {
+                        "type": "action_set_exposure",
+                        "schedule_item_id": self.schedule["current_item_id"],
+                        "action": "set exposure",
+                    }
+                    self.update_scheduler_state_obj(item_state)
+                    self.logger.info(
+                        f"Trying to set exposure to {cur_schedule_item['params']}"
+                    )
+                    self.action_set_exposure(cur_schedule_item["params"])
                 else:
-                    request: MessageParams = {"method": action}
-                self.send_message_param_sync(request)
+                    if "params" in cur_schedule_item:
+                        request: MessageParams = {
+                            "method": action,
+                            "params": cur_schedule_item["params"],
+                        }
+                    else:
+                        request: MessageParams = {"method": action}
+                    self.send_message_param_sync(request)
+            except Exception:
+                self.logger.error(
+                    f"Schedule item {index + 1} ({action}) failed; moving on to the next item.",
+                    exc_info=True,
+                )
+                self.is_cur_scheduler_item_working = False
             index += 1
             self.schedule["is_skip_requested"] = False
 
