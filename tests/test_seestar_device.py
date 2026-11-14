@@ -3503,3 +3503,86 @@ def test_scheduler_thread_fn_dispatches_start_framed_mosaic(monkeypatch, seestar
     seestar.scheduler_thread_fn()
 
     assert calls == [{"target_name": "T"}]
+
+
+# A scope that reboots mid-schedule answers its first requests late or with an error. The scheduler must
+# survive that: the item fails or degrades, and the schedule moves on instead of dying while it still
+# reports "working".
+
+
+@pytest.mark.parametrize(
+    "get_setting_response",
+    [
+        {"result": "Error: Exceeded allotted wait time for result"},
+        {"error": "device not connected", "code": 318},
+    ],
+)
+def test_start_mosaic_item_starts_mosaic_when_get_setting_fails(
+    monkeypatch, seestar, get_setting_response
+):
+    received = _setup_mosaic_item_test(monkeypatch, seestar)
+    monkeypatch.setattr(
+        seestar, "send_message_param_sync", lambda _p: get_setting_response
+    )
+
+    seestar.start_mosaic_item(_mosaic_item_params())
+
+    assert "stack_type" in received  # the mosaic thread was launched
+    assert seestar.is_cur_scheduler_item_working is True
+
+
+def test_scheduler_thread_fn_moves_on_when_an_item_raises(monkeypatch, seestar):
+    monkeypatch.setattr("device.seestar_device.time.sleep", lambda _s: None)
+    monkeypatch.setattr(seestar, "play_sound", lambda _v: None)
+    started = []
+
+    def fake_start_mosaic_item(params):
+        started.append(params["target_name"])
+        if params["target_name"] == "first":
+            raise AttributeError("'str' object has no attribute 'get'")
+        seestar.is_cur_scheduler_item_working = False
+
+    monkeypatch.setattr(seestar, "start_mosaic_item", fake_start_mosaic_item)
+    seestar.schedule["list"] = collections.deque(
+        [
+            {
+                "schedule_item_id": "m1",
+                "action": "start_mosaic",
+                "params": {"target_name": "first"},
+            },
+            {
+                "schedule_item_id": "m2",
+                "action": "start_mosaic",
+                "params": {"target_name": "second"},
+            },
+        ]
+    )
+    seestar.schedule["item_number"] = 1
+    seestar.schedule["state"] = "stopped"
+
+    seestar.scheduler_thread_fn()
+
+    assert started == ["first", "second"]
+    assert seestar.schedule["state"] == "complete"
+    assert seestar.is_cur_scheduler_item_working is False
+
+
+def test_goto_target_clears_goto_mark_when_scope_rejects_goto(monkeypatch, seestar):
+    class FakeCoord:
+        ra = SimpleNamespace(hour=21.61)
+        dec = SimpleNamespace(deg=57.61)
+
+    monkeypatch.setattr(
+        "device.seestar_device.Util.parse_coordinate", lambda *args, **kwargs: FakeCoord
+    )
+    sent = []
+    seestar.send_message_param_sync = lambda payload: (
+        sent.append(payload) or {"error": "device not connected", "code": 318}
+    )
+    target = {"is_j2000": False, "ra": 21.61, "dec": 57.61, "target_name": "IC1396A"}
+
+    assert seestar.goto_target(target) is False
+    assert seestar.is_goto() is False
+    # the next goto is sent to the scope rather than refused as "mount is in goto routine"
+    assert seestar.goto_target(target) is False
+    assert len(sent) == 2
